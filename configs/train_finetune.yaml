@@ -1,0 +1,27 @@
+# Stage 2: End-to-End Fine-tuning
+
+_base_: default.yaml
+
+training:
+  stage: finetune
+  finetune:
+    epochs: 100
+    batch_size: 8
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    warmup_steps: 1000
+    lambda_box: 5.0
+    lambda_giou: 2.0
+    lambda_cls: 2.0
+  freeze_yolo: true
+  freeze_delta_encoder: false
+  freeze_fusion: false
+
+hevc:
+  default_qp: 27
+  default_gop: 16
+
+logging:
+  log_interval: 50
+  save_interval: 5
+  eval_interval: 5

@@ -1,0 +1,111 @@
+# CoPE-Δ-Det Default Configuration
+
+# Paths
+paths:
+  bdd100k_root: ./data/bdd100k
+  hevc_encoded: ./data/bdd100k_hevc
+  extracted_features: ./data/bdd100k_features
+  checkpoints: ./checkpoints
+  logs: ./logs
+  results: ./results
+
+# HEVC encoding settings
+hevc:
+  encoder: ffmpeg          # 'ffmpeg' for prototyping, 'hm' for final experiments
+  qp_values: [22, 27, 32, 37]
+  gop_lengths: [8, 16, 32]
+  default_qp: 27
+  default_gop: 16
+  profile: main
+  preset: medium           # FFmpeg x265 preset
+
+# Feature extraction
+features:
+  mv_resolution: [45, 80]  # H/16 x W/16 for 720x1280
+  residual_resolution: [45, 80]
+  patch_size: 16
+  context_padding: 0.2     # 20% context padding for RoI-Align
+
+# Model architecture
+model:
+  # Δ-Det Encoder
+  delta_encoder:
+    embed_dim: 256
+    motion_tokens: 4        # K_τ
+    residual_tokens: 4      # K_δ
+    num_heads: 4
+    num_layers: 2
+    roi_output_size: 7
+    mlp_hidden_dim: 512
+
+  # Temporal Fusion Head
+  temporal_fusion:
+    embed_dim: 256
+    num_heads: 4
+    num_layers: 3
+    ffn_dim: 512
+    dropout: 0.1
+
+  # YOLO anchor detector
+  yolo:
+    model_name: yolov8m.pt
+    conf_threshold: 0.25
+    iou_threshold: 0.45
+    max_det: 100
+
+  # Refresh policy
+  refresh:
+    w1: 0.6
+    w2: 0.4
+    threshold: 0.5
+    ewma_alpha: 0.7
+    tile_size: 32
+
+# Training
+training:
+  # Stage 1: Pre-training
+  pretrain:
+    epochs: 50
+    batch_size: 16
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    warmup_steps: 500
+
+  # Stage 2: Fine-tuning
+  finetune:
+    epochs: 100
+    batch_size: 8
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    warmup_steps: 1000
+    lambda_box: 5.0
+    lambda_giou: 2.0
+    lambda_cls: 2.0
+
+  optimizer: adamw
+  scheduler: cosine
+
+# Evaluation
+evaluation:
+  iou_thresholds: [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+  decode_budgets: [0.05, 0.1, 0.15, 0.2, 0.3, 0.5]
+
+# BDD100K classes
+classes:
+  - pedestrian
+  - rider
+  - car
+  - truck
+  - bus
+  - train
+  - motorcycle
+  - bicycle
+  - traffic light
+  - traffic sign
+
+num_classes: 10
+
+# Hardware
+device: cuda
+num_workers: 4
+seed: 42

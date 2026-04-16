@@ -1,0 +1,32 @@
+# Evaluation Configuration
+
+_base_: default.yaml
+
+evaluation:
+  checkpoint: ./checkpoints/best_model.pt
+  split: train
+  iou_thresholds: [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+
+  # Codec robustness sweep
+  codec_sweep:
+    qp_values: [22, 27, 32, 37]
+    gop_lengths: [8, 16, 32]
+
+  # Pareto analysis
+  pareto:
+    decode_budgets: [0.05, 0.1, 0.15, 0.2, 0.3, 0.5]
+
+  # Ablation flags
+  ablations:
+    mv_only: false
+    residual_only: false
+    no_partition_depth: false
+    no_pred_mode: false
+    use_bilstm: false
+    num_delta_tokens: [4, 8, 16]
+    disable_refresh: false
+
+  # Timing
+  measure_latency: true
+  warmup_iterations: 10
+  timing_iterations: 100

@@ -1,0 +1,24 @@
+# Stage 1: Δ-Encoder Alignment Pre-training
+
+_base_: default.yaml
+
+training:
+  stage: pretrain
+  pretrain:
+    epochs: 50
+    batch_size: 16
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    warmup_steps: 500
+  loss: mse       # MSE between Δ-tokens and YOLO box features
+  freeze_yolo: true
+  freeze_fusion: true
+
+hevc:
+  default_qp: 27
+  default_gop: 16
+
+logging:
+  log_interval: 50
+  save_interval: 5
+  eval_interval: 5

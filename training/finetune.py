@@ -106,10 +106,7 @@ def train_finetune_epoch(dataloader, model, optimizer, scheduler, loss_fn, devic
 
                 pred_boxes = torch.cat(pred_t['boxes'], dim=0) if len(pred_t['boxes']) > 0 else torch.empty((0,4), device=device)
                 pred_conf = torch.cat(pred_t['confs'], dim=0) if len(pred_t['confs']) > 0 else torch.empty((0,1), device=device)
-                pred_cls = torch.cat(pred_t['classes'], dim=0) if len(pred_t['classes']) > 0 else torch.empty((0,1), device=device)
-
-                if pred_cls.shape[1] != num_classes:
-                    pred_cls = torch.zeros((pred_boxes.shape[0], num_classes), device=device)
+                pred_cls = torch.cat(pred_t['classes'], dim=0) if len(pred_t['classes']) > 0 else torch.empty((0, num_classes), device=device)
 
                 tgt_boxes = []
                 tgt_cls_list = []
@@ -189,6 +186,12 @@ if __name__ == '__main__':
                         help="'coco_to_bdd', 'identity', or omit for dataset default")
     parser.add_argument('--annotated_only', action='store_true',
                         help='Filter to annotated GOPs only (BDD legacy)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help="Path to a {prefix}finetuned_model_epoch_N.pt to resume from; "
+                             "training continues from epoch N+1")
+    parser.add_argument('--num_workers', type=int, default=8,
+                        help="Dataloader workers (higher = more I/O overlap)")
+    parser.add_argument('--gop_length', type=int, default=16)
     args = parser.parse_args()
 
     # Dataset-specific defaults
@@ -210,15 +213,15 @@ if __name__ == '__main__':
 
     # 1. Dataset
     dataset = BDD100KCoPEDataset(root_dir=args.root, split='train',
-                                  gop_length=16,
+                                  gop_length=args.gop_length,
                                   annotated_only=annotated_only_flag,
                                   features_subdir=args.features,
                                   dataset_type=args.dataset)
     # batch_size=1 (GOP-level), but we use gradient accumulation (accum_steps=4) for effective batch=4
-    # num_workers=4 for parallel data loading (video decode + NPZ reads overlap with GPU compute)
-    # persistent_workers keeps workers alive between epochs to avoid respawn overhead
+    # num_workers high to overlap JPEG decode + NPZ reads with GPU compute
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_fn,
-                            num_workers=4, pin_memory=True, persistent_workers=True)
+                            num_workers=args.num_workers, pin_memory=True,
+                            persistent_workers=True, prefetch_factor=4)
 
     # 2. Model
     model = CoPEDeltaDet(yolo_size=args.yolo_weights, embed_dim=256,
@@ -254,15 +257,61 @@ if __name__ == '__main__':
 
     prefix = args.prefix
     best_loss = float('inf')
+    start_epoch = 0
+
+    # Resume from a previous checkpoint if requested
+    if args.resume and os.path.exists(args.resume):
+        print(f"Resuming from {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device)
+        if 'delta_encoder' in ckpt:
+            model.delta_encoder.load_state_dict(ckpt['delta_encoder'])
+        if 'fusion_head' in ckpt:
+            model.fusion_head.load_state_dict(ckpt['fusion_head'])
+        start_epoch = int(ckpt.get('epoch', 0))
+        prev_loss = float(ckpt.get('loss', float('inf')))
+        best_loss = min(best_loss, prev_loss)
+        # Fast-forward LR scheduler to the correct step count
+        # (number of optimizer steps that already happened = start_epoch * (len(dataloader) // accum_steps))
+        opt_steps_done = start_epoch * max(1, len(dataloader) // accum_steps)
+        for _ in range(opt_steps_done):
+            sch.step()
+        print(f"  Resumed at epoch {start_epoch}, prev_loss={prev_loss:.4f}, "
+              f"scheduler fast-forwarded by {opt_steps_done} steps")
+
     print(f"Starting Fine-tuning: {num_epochs} epochs, {len(dataloader)} steps/epoch")
     print(f"  Mixed precision: enabled, Gradient accumulation: {accum_steps} steps")
-    print(f"  DataLoader workers: 4, pin_memory: True")
+    print(f"  DataLoader workers: {args.num_workers}, pin_memory: True")
     print(f"  Checkpoint prefix: '{prefix}'")
-    for epoch in range(num_epochs):
+    print(f"  Starting at epoch {start_epoch+1}")
+
+    # ── Loss history ─────────────────────────────────────────────────────
+    # Records (epoch, loss) so we can plot convergence / decide if more
+    # epochs are worthwhile. JSON history is resumable across runs.
+    import json
+    history_path = f"D:/cope-delta-det2/checkpoints/{prefix}loss_history.json"
+    loss_history = []
+    if os.path.exists(history_path):
+        try:
+            with open(history_path, 'r') as f:
+                loss_history = json.load(f)
+            # Drop entries >= start_epoch to avoid duplicates on resume
+            loss_history = [h for h in loss_history if h['epoch'] <= start_epoch]
+            print(f"  Loaded {len(loss_history)} prior loss records from {history_path}")
+        except Exception as e:
+            print(f"  (note) could not load prior history: {e}")
+            loss_history = []
+
+    for epoch in range(start_epoch, num_epochs):
         loss = train_finetune_epoch(dataloader, model, opt, sch, loss_fn, device=device,
                                      scaler=scaler, accum_steps=accum_steps,
                                      num_classes=args.num_classes)
         print(f"Epoch {epoch+1}/{num_epochs} - Avg Loss: {loss:.4f}")
+
+        # Record loss history + persist to disk after every epoch so a crash
+        # doesn't lose data
+        loss_history.append({'epoch': epoch + 1, 'loss': float(loss)})
+        with open(history_path, 'w') as f:
+            json.dump(loss_history, f, indent=2)
 
         # Save only trainable components (not frozen YOLO which fuses BN at runtime)
         ckpt = {
@@ -279,3 +328,38 @@ if __name__ == '__main__':
             print(f"  -> New best model (loss={loss:.4f})")
 
     print(f"Fine-tuning complete. Best loss: {best_loss:.4f}")
+
+    # ── Plot loss curve ──────────────────────────────────────────────────
+    try:
+        import matplotlib
+        matplotlib.use('Agg')  # headless backend
+        import matplotlib.pyplot as plt
+
+        epochs_plot = [h['epoch'] for h in loss_history]
+        losses_plot = [h['loss'] for h in loss_history]
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs_plot, losses_plot, 'b-o', linewidth=2, markersize=6, label='Train loss')
+
+        # Mark the best epoch
+        if losses_plot:
+            best_idx = losses_plot.index(min(losses_plot))
+            plt.axhline(y=losses_plot[best_idx], color='g', linestyle='--', alpha=0.5,
+                        label=f'Best (epoch {epochs_plot[best_idx]}): {losses_plot[best_idx]:.4f}')
+
+        plt.xlabel('Epoch')
+        plt.ylabel('Average Loss')
+        plt.title(f"CoPE-Delta-Det Fine-tuning Loss ({args.dataset}, {args.num_classes} classes)")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+
+        plot_path = f"D:/cope-delta-det2/checkpoints/{prefix}loss_curve.png"
+        plt.savefig(plot_path, dpi=120)
+        plt.close()
+        print(f"Loss curve saved to {plot_path}")
+        print(f"Loss history JSON saved to {history_path}")
+    except ImportError:
+        print("(note) matplotlib not installed; skipping loss plot")
+    except Exception as e:
+        print(f"(note) plot failed: {e}")

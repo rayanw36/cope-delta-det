@@ -62,11 +62,16 @@ class CoPEDeltaDet(nn.Module):
             if res.shape[0] > 0:
                 frame_0_boxes.append(res[:, :4])
                 frame_0_confs.append(res[:, 4:5])
-                frame_0_classes.append(res[:, 5:6])
+                # Convert YOLO class ID [N, 1] to one-hot logits [N, num_classes]
+                # so frame 0 classes have the same format as P-frame cls_scores
+                cls_ids = res[:, 5].long()
+                cls_onehot = torch.zeros(res.shape[0], self.num_classes, device=device)
+                cls_onehot.scatter_(1, cls_ids.unsqueeze(1), 5.0)  # high logit for detected class
+                frame_0_classes.append(cls_onehot)
             else:
                 frame_0_boxes.append(torch.empty((0, 4), device=device))
                 frame_0_confs.append(torch.empty((0, 1), device=device))
-                frame_0_classes.append(torch.empty((0, 1), device=device))
+                frame_0_classes.append(torch.empty((0, self.num_classes), device=device))
                 
         results_per_frame.append({
             'boxes': frame_0_boxes,
@@ -121,20 +126,22 @@ class CoPEDeltaDet(nn.Module):
                 unpacked_boxes = []
                 unpacked_confs = []
                 unpacked_classes = []
-                
+
                 ptr = 0
                 for b_idx in range(batch_size):
                     num_obj = current_boxes[b_idx].shape[0]
                     if num_obj > 0:
                         unpacked_boxes.append(updated_boxes_flat[ptr:ptr+num_obj])
                         unpacked_confs.append(updated_confs_flat[ptr:ptr+num_obj])
-                        # Keep original classes for now, or optionally update with cls_scores.argmax()
-                        unpacked_classes.append(current_classes[b_idx])
+                        # Use fusion head class scores [N, num_classes] instead of
+                        # the raw YOLO class ID, so the classification branch
+                        # is trainable and the loss receives real logits.
+                        unpacked_classes.append(cls_scores[ptr:ptr+num_obj])
                         ptr += num_obj
                     else:
                         unpacked_boxes.append(torch.empty((0, 4), device=device))
                         unpacked_confs.append(torch.empty((0, 1), device=device))
-                        unpacked_classes.append(torch.empty((0, 1), device=device))
+                        unpacked_classes.append(torch.empty((0, self.num_classes), device=device))
                         
                 current_boxes = unpacked_boxes
                 current_confs = unpacked_confs

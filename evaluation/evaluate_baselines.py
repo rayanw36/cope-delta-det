@@ -21,22 +21,20 @@ from models.cope_delta_det import CoPEDeltaDet
 from utils.metrics import COCOMetrics, LatencyTracker, DecodeBudgetTracker
 from utils.box_utils import xyxy_to_xywh, xywh_to_xyxy
 
-def evaluate_baseline(model, dataset, device, mode='cope'):
+def evaluate_baseline(model, dataset, device, mode='cope', num_classes=10, max_eval=50):
     """
     Evaluates Video Obj Detection on specific baseline architectures:
     * 'yolo_full' : Runs heavy YOLO object detection on every single frame.
-    * 'copy_paste': Runs YOLO on I-frame, and just locks boxes into place on P-frames 
+    * 'copy_paste': Runs YOLO on I-frame, and just locks boxes into place on P-frames
                     (zero tracking math, lowest possible cost but terrible accuracy).
     * 'cope'      : Runs our custom CoPE-Delta-Det2 framework.
     """
     model.eval()
-    metrics = COCOMetrics(num_classes=10)
+    metrics = COCOMetrics(num_classes=num_classes)
     latency = LatencyTracker()
     decode_tracker = DecodeBudgetTracker()
 
     with torch.no_grad():
-        # Limit evaluation to 50 valid GOPs for speed and proof-of-concept
-        max_eval = 50
         evaluated_count = 0
         
         pbar = tqdm(total=max_eval, desc=f"Evaluating mode: {mode}")
@@ -163,51 +161,115 @@ def evaluate_baseline(model, dataset, device, mode='cope'):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run baseline evaluations.')
-    parser.add_argument('--mode', type=str, default='all', choices=['yolo_full', 'copy_paste', 'cope', 'all'])
+    parser.add_argument('--mode', type=str, default='all',
+                        choices=['yolo_full', 'copy_paste', 'cope', 'all'])
+    parser.add_argument('--dataset', type=str, default='bdd100k',
+                        choices=['bdd100k', 'imagenetvid'])
+    parser.add_argument('--root', type=str, default=None,
+                        help='Dataset root dir (defaults based on --dataset)')
+    parser.add_argument('--split', type=str, default=None,
+                        help="Dataset split (default: 'train' for bdd, 'val' for vid)")
+    parser.add_argument('--num_classes', type=int, default=None,
+                        help='Class count (defaults: bdd100k=10, imagenetvid=30)')
+    parser.add_argument('--yolo_weights', type=str, default='yolov8m.pt',
+                        help='YOLO checkpoint (use fine-tuned best.pt for VID)')
+    parser.add_argument('--class_mapping', type=str, default=None,
+                        help="'coco_to_bdd', 'identity', or omit for dataset default")
+    parser.add_argument('--features', type=str, default='features',
+                        choices=['features', 'features_pyav'])
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Path to finetuned CoPE checkpoint (delta_encoder+fusion_head)')
+    parser.add_argument('--gop_length', type=int, default=16)
+    parser.add_argument('--max_eval', type=int, default=50,
+                        help='Max GOPs to evaluate per mode (default 50)')
+    parser.add_argument('--annotated_only', action='store_true',
+                        help='Filter to annotated GOPs only (BDD legacy)')
     args = parser.parse_args()
+
+    # Dataset-specific defaults
+    if args.root is None:
+        args.root = ('D:/cope-delta-det2/data/bdd100k' if args.dataset == 'bdd100k'
+                     else 'D:/cope-delta-det2/data/imagenetvid')
+    if args.num_classes is None:
+        args.num_classes = 10 if args.dataset == 'bdd100k' else 30
+    if args.class_mapping is None:
+        args.class_mapping = 'coco_to_bdd' if args.dataset == 'bdd100k' else 'identity'
+    if args.split is None:
+        args.split = 'train' if args.dataset == 'bdd100k' else 'val'
+    if args.checkpoint is None:
+        args.checkpoint = ('D:/cope-delta-det2/checkpoints/finetuned_best.pt'
+                           if args.dataset == 'bdd100k'
+                           else 'D:/cope-delta-det2/checkpoints/vid_finetuned_best.pt')
+    annotated_only_flag = args.annotated_only or (args.dataset == 'bdd100k')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Preparing baseline benchmarks on {device}...")
+    print(f"  Dataset: {args.dataset}  root={args.root}  split={args.split}  "
+          f"num_classes={args.num_classes}")
+    print(f"  YOLO weights: {args.yolo_weights}  class_mapping={args.class_mapping}")
+    print(f"  Features: {args.features}  Checkpoint: {args.checkpoint}")
+    print(f"  Max eval GOPs per mode: {args.max_eval}")
 
-    # Load dataset using 'train' split since the validation videos were not downloaded locally
-    base_dir = Path(__file__).resolve().parent.parent / "data" / "bdd100k"
-    dataset = BDD100KCoPEDataset(root_dir=str(base_dir), split='train', gop_length=16, annotated_only=True)
+    dataset = BDD100KCoPEDataset(root_dir=args.root, split=args.split,
+                                  gop_length=args.gop_length,
+                                  annotated_only=annotated_only_flag,
+                                  features_subdir=args.features,
+                                  dataset_type=args.dataset)
 
-    model = CoPEDeltaDet(yolo_size='yolov8m.pt', embed_dim=256, num_classes=10, device=device).to(device)
-    
-    # Load Stage 2 Finetuned tracking weights
-    # Load finetuned weights (only delta_encoder + fusion_head, not frozen YOLO)
-    ckpt_path = "D:/cope-delta-det2/checkpoints/finetuned_best.pt"
+    model = CoPEDeltaDet(yolo_size=args.yolo_weights, embed_dim=256,
+                         num_classes=args.num_classes, device=device).to(device)
+
+    # Propagate class_mapping to the YOLO anchor inside the model, if supported
+    try:
+        if hasattr(model.anchor_detector, 'class_mapping'):
+            if args.class_mapping in (None, 'identity'):
+                model.anchor_detector.class_mapping = None
+            elif args.class_mapping == 'coco_to_bdd':
+                model.anchor_detector.class_mapping = {
+                    0: 0, 1: 7, 2: 2, 3: 6, 5: 4, 6: 5, 7: 3, 9: 8, 11: 9,
+                }
+    except Exception as e:
+        print(f"  (note) could not set class_mapping on anchor: {e}")
+
+    # Load Stage 2 Finetuned tracking weights (only delta_encoder + fusion_head)
+    ckpt_path = args.checkpoint
     if Path(ckpt_path).exists():
         ckpt = torch.load(ckpt_path, map_location=device)
         if 'delta_encoder' in ckpt:
             model.delta_encoder.load_state_dict(ckpt['delta_encoder'])
             model.fusion_head.load_state_dict(ckpt['fusion_head'])
-            print(f"Loaded finetuned CoPE tracker (epoch {ckpt.get('epoch', '?')}, loss {ckpt.get('loss', '?'):.1f})")
+            loss_val = ckpt.get('loss', None)
+            loss_str = f"{loss_val:.1f}" if isinstance(loss_val, (int, float)) else str(loss_val)
+            print(f"Loaded finetuned CoPE tracker (epoch {ckpt.get('epoch', '?')}, loss {loss_str})")
         else:
             # Legacy: full model state_dict
             model.load_state_dict(ckpt, strict=False)
             print("Loaded checkpoint (legacy format, strict=False)")
     else:
-        print("WARNING: Could not find checkpoint so checking untrained CoPE architecture fallback.")
+        print(f"WARNING: Could not find checkpoint at {ckpt_path}; running with untrained CoPE components.")
 
     modes_to_test = ['yolo_full', 'copy_paste', 'cope'] if args.mode == 'all' else [args.mode]
-    
+
     final_reports = []
     print("\n" + "="*50)
     model.eval()
-    
+
     for m in modes_to_test:
-        res = evaluate_baseline(model, dataset, device, mode=m)
+        res = evaluate_baseline(model, dataset, device, mode=m,
+                                num_classes=args.num_classes,
+                                max_eval=args.max_eval)
         final_reports.append(res)
-        
+
         print(f"\n--- RESULTS FOR: {m.upper()} ---")
         print(f"Decode Budget (Compute Cost): {res['decode_budget']:.1f}%")
-        print(f"Tracking Accuracy (mAP@50):   {res['mAP_50']*100:.2f}%")
+        print(f"mAP@50:                       {res['mAP_50']*100:.2f}%")
+        print(f"mAP@[.5:.95]:                 {res['mAP_50_95']*100:.2f}%")
         print(f"Latency Per GOP:              {res['latency_ms']:.2f}ms")
         print("="*50)
 
-    # Save to JSON
-    with open("D:/cope-delta-det2/checkpoints/baseline_comparison.json", "w") as f:
+    # Save to JSON (prefix per-dataset so BDD + VID don't overwrite each other)
+    out_name = 'baseline_comparison.json' if args.dataset == 'bdd100k' else 'baseline_comparison_vid.json'
+    out_path = f"D:/cope-delta-det2/checkpoints/{out_name}"
+    with open(out_path, "w") as f:
         json.dump(final_reports, f, indent=4)
-        print("\nAll baseline tables logged successfully to baseline_comparison.json!")
+        print(f"\nAll baseline tables logged successfully to {out_path}!")

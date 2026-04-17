@@ -138,12 +138,15 @@ def evaluate_cope_delta_det(model, dataset, device, measure_latency=True, policy
                     if pred_conf.ndim == 0:
                         pred_conf = np.array([pred_conf])
 
-                    # Handle classes
-                    pred_cls = pred_t['classes'][0].cpu().numpy().squeeze()
-                    if pred_cls.ndim == 0:
-                        pred_cls = np.array([pred_cls]).astype(np.int64)
+                    # Handle classes — may be [N, num_classes] logits or [N, 1] IDs
+                    raw_cls = pred_t['classes'][0].cpu()
+                    if raw_cls.ndim == 2 and raw_cls.shape[1] > 1:
+                        # Logits from fusion head — take argmax
+                        pred_cls = raw_cls.argmax(dim=1).numpy().astype(np.int64)
                     else:
-                        pred_cls = pred_cls.astype(np.int64)
+                        pred_cls = raw_cls.numpy().squeeze().astype(np.int64)
+                        if pred_cls.ndim == 0:
+                            pred_cls = np.array([pred_cls])
                 else:
                     pred_boxes = np.zeros((0, 4))
                     pred_conf = np.zeros(0)

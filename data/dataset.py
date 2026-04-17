@@ -213,15 +213,19 @@ class BDD100KCoPEDataset(Dataset):
             rgbs_list = []
             for fn in frame_names:
                 jpg_path = self.vid_data_root / fn
-                try:
-                    img = Image.open(jpg_path).convert('RGB')
-                    # Normalise to 720x1280 if the snippet has a different size
-                    if img.size != (1280, 720):
-                        img = img.resize((1280, 720), Image.BILINEAR)
-                    rgbs_list.append(self.transform(img))
-                except Exception as e:
-                    print(f"WARNING: failed to read {jpg_path}: {e}")
+                # cv2 is ~3x faster than PIL for JPEG decoding.
+                # cv2.resize with INTER_LINEAR is SIMD-optimized.
+                bgr = cv2.imread(str(jpg_path), cv2.IMREAD_COLOR)
+                if bgr is None:
+                    print(f"WARNING: failed to read {jpg_path}")
                     rgbs_list.append(torch.zeros((3, 720, 1280)))
+                    continue
+                if bgr.shape[:2] != (720, 1280):
+                    bgr = cv2.resize(bgr, (1280, 720), interpolation=cv2.INTER_LINEAR)
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                # [H, W, 3] uint8 -> [3, H, W] float32 in [0, 1]
+                tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous().float().div_(255.0)
+                rgbs_list.append(tensor)
             return rgbs_list
 
         vid_path = self._find_video(video_name)

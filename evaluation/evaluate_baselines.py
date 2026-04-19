@@ -174,7 +174,7 @@ if __name__ == '__main__':
     parser.add_argument('--yolo_weights', type=str, default='yolov8m.pt',
                         help='YOLO checkpoint (use fine-tuned best.pt for VID)')
     parser.add_argument('--class_mapping', type=str, default=None,
-                        help="'coco_to_bdd', 'identity', or omit for dataset default")
+                        help="'coco_to_bdd', 'coco_to_vid', 'identity', or omit for dataset default")
     parser.add_argument('--features', type=str, default='features',
                         choices=['features', 'features_pyav'])
     parser.add_argument('--checkpoint', type=str, default=None,
@@ -184,6 +184,8 @@ if __name__ == '__main__':
                         help='Max GOPs to evaluate per mode (default 50)')
     parser.add_argument('--annotated_only', action='store_true',
                         help='Filter to annotated GOPs only (BDD legacy)')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Path to save JSON results (default: checkpoints/baseline_comparison[_vid].json)')
     args = parser.parse_args()
 
     # Dataset-specific defaults
@@ -193,6 +195,8 @@ if __name__ == '__main__':
     if args.num_classes is None:
         args.num_classes = 10 if args.dataset == 'bdd100k' else 30
     if args.class_mapping is None:
+        # identity = correct for VID-finetuned YOLO (nc=30, outputs VID IDs directly)
+        # coco_to_vid = correct for COCO-pretrained yolov8m.pt (nc=80)
         args.class_mapping = 'coco_to_bdd' if args.dataset == 'bdd100k' else 'identity'
     if args.split is None:
         args.split = 'train' if args.dataset == 'bdd100k' else 'val'
@@ -220,14 +224,23 @@ if __name__ == '__main__':
                          num_classes=args.num_classes, device=device).to(device)
 
     # Propagate class_mapping to the YOLO anchor inside the model, if supported
+    COCO_TO_VID = {
+        4: 0, 21: 2, 1: 3, 14: 4, 5: 5, 2: 6, 7: 6,
+        19: 7, 16: 8, 15: 9, 20: 10, 17: 14, 3: 18,
+        18: 21, 6: 25, 8: 27, 22: 29,
+    }
     try:
         if hasattr(model.anchor_detector, 'class_mapping'):
             if args.class_mapping in (None, 'identity'):
                 model.anchor_detector.class_mapping = None
+                print(f"  class_mapping: identity (VID-finetuned YOLO outputs VID IDs directly)")
             elif args.class_mapping == 'coco_to_bdd':
                 model.anchor_detector.class_mapping = {
                     0: 0, 1: 7, 2: 2, 3: 6, 5: 4, 6: 5, 7: 3, 9: 8, 11: 9,
                 }
+            elif args.class_mapping == 'coco_to_vid':
+                model.anchor_detector.class_mapping = COCO_TO_VID
+                print(f"  class_mapping: coco_to_vid ({len(COCO_TO_VID)} pairs)")
     except Exception as e:
         print(f"  (note) could not set class_mapping on anchor: {e}")
 
@@ -267,9 +280,13 @@ if __name__ == '__main__':
         print(f"Latency Per GOP:              {res['latency_ms']:.2f}ms")
         print("="*50)
 
-    # Save to JSON (prefix per-dataset so BDD + VID don't overwrite each other)
-    out_name = 'baseline_comparison.json' if args.dataset == 'bdd100k' else 'baseline_comparison_vid.json'
-    out_path = f"D:/cope-delta-det2/checkpoints/{out_name}"
+    # Save to JSON
+    if args.output:
+        out_path = args.output
+    else:
+        out_name = 'baseline_comparison.json' if args.dataset == 'bdd100k' else 'baseline_comparison_vid.json'
+        out_path = f"D:/cope-delta-det2/checkpoints/{out_name}"
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(final_reports, f, indent=4)
-        print(f"\nAll baseline tables logged successfully to {out_path}!")
+    print(f"\nAll baseline results saved to {out_path}!")

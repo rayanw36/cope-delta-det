@@ -23,19 +23,25 @@ from models.refresh_policy import SaliencyRefreshPolicy
 from utils.metrics import COCOMetrics, LatencyTracker, DecodeBudgetTracker
 from utils.box_utils import xyxy_to_xywh, xywh_to_xyxy
 
-def evaluate_cope_delta_det(model, dataset, device, measure_latency=True, policy_w1=1.0, policy_w2=1.0, policy_thresh=0.5, num_classes=10):
-    """Evaluate CoPE-Δ-Det on a dataset using the unified forward pass."""
+def evaluate_cope_delta_det(model, dataset, device, measure_latency=True, policy_w1=1.0, policy_w2=1.0, policy_thresh=0.5, num_classes=10, max_eval=None):
+    """Evaluate CoPE-Δ-Det on a dataset using the unified forward pass.
+
+    Set policy_thresh >= 999 to disable the refresh policy entirely (pure CoPE,
+    delta encoder runs on every P-frame, decode budget ≈ 6.25%).
+    """
     model.eval()
     metrics = COCOMetrics(num_classes=num_classes)
     latency = LatencyTracker() if measure_latency else None
     decode_tracker = DecodeBudgetTracker()
-    
+
+    policy_disabled = policy_thresh >= 999
     refresh_policy = SaliencyRefreshPolicy(init_threshold=policy_thresh).to(device)
     refresh_policy.w1.data = torch.tensor(policy_w1, device=device)
     refresh_policy.w2.data = torch.tensor(policy_w2, device=device)
 
+    n_total = len(dataset) if max_eval is None else min(max_eval, len(dataset))
     with torch.no_grad():
-        for idx in tqdm(range(len(dataset)), desc="Evaluating CoPE-Δ-Det"):
+        for idx in tqdm(range(n_total), desc="Evaluating CoPE-Δ-Det"):
             sample = dataset[idx]
             
             # Map sample elements to device
@@ -76,9 +82,13 @@ def evaluate_cope_delta_det(model, dataset, device, measure_latency=True, policy
                 # 1. Ask Saliency Policy if we need to refresh
                 # using the residual (1 channel) and MVs
                 res_1c = r_feat.unsqueeze(0) # [1, 1, 45, 80]
-                refresh_flags, _ = refresh_policy(res_1c, mvs_t, current_boxes)
-                
-                if refresh_flags.any().item():
+                if policy_disabled:
+                    do_refresh = False
+                else:
+                    refresh_flags, _ = refresh_policy(res_1c, mvs_t, current_boxes)
+                    do_refresh = refresh_flags.any().item()
+
+                if do_refresh:
                     # REFRESH! Run YOLO on P-frame RGB!
                     decode_tracker.record_iframe() # Counts as full decode
                     fallback_rgb = pframe_rgbs[t].unsqueeze(0).to(device)
@@ -88,8 +98,9 @@ def evaluate_cope_delta_det(model, dataset, device, measure_latency=True, policy
                     current_confs = [r[:, 4:5] if r.shape[0] > 0 else torch.empty((0, 1), device=device) for r in anchor_results]
                     current_classes = [r[:, 5:6] if r.shape[0] > 0 else torch.empty((0, 1), device=device) for r in anchor_results]
                     
-                    refresh_policy.reset_states()
-                    
+                    if not policy_disabled:
+                        refresh_policy.reset_states()
+
                 else:
                     # STANDARD COPE DECODE!
                     decode_tracker.record_pframe(was_refreshed=False)
@@ -189,8 +200,12 @@ def main():
     parser.add_argument('--num_classes', type=int, default=None)
     parser.add_argument('--yolo_weights', type=str, default='yolov8m.pt')
     parser.add_argument('--class_mapping', type=str, default=None,
-                        help="'coco_to_bdd', 'identity', or omit for dataset default")
+                        help="'coco_to_bdd', 'coco_to_vid', 'identity', or omit for dataset default")
     parser.add_argument('--annotated_only', action='store_true')
+    parser.add_argument('--policy_thresh', type=float, default=0.5,
+                        help='Saliency refresh threshold. Set to 999 to disable (pure CoPE, no refresh).')
+    parser.add_argument('--max_eval', type=int, default=None,
+                        help='Max GOPs to evaluate (default: all)')
     args = parser.parse_args()
 
     # Dataset-specific defaults
@@ -200,7 +215,7 @@ def main():
     if args.num_classes is None:
         args.num_classes = 10 if args.dataset == 'bdd100k' else 30
     if args.class_mapping is None:
-        args.class_mapping = 'coco_to_bdd' if args.dataset == 'bdd100k' else 'identity'
+        args.class_mapping = 'coco_to_bdd' if args.dataset == 'bdd100k' else 'coco_to_vid'
     annotated_only_flag = args.annotated_only or (args.dataset == 'bdd100k')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -215,12 +230,36 @@ def main():
     ).to(device)
 
     # Propagate class_mapping to YOLO anchor
+    # coco_to_vid: COCO 80-class IDs → ImageNet VID 30-class IDs
+    COCO_TO_VID = {
+        4: 0,   # airplane
+        21: 2,  # bear
+        1: 3,   # bicycle
+        14: 4,  # bird
+        5: 5,   # bus
+        2: 6,   # car
+        7: 6,   # truck → car
+        19: 7,  # cow → cattle
+        16: 8,  # dog
+        15: 9,  # cat → domestic cat
+        20: 10, # elephant
+        17: 14, # horse
+        3: 18,  # motorcycle
+        18: 21, # sheep
+        6: 25,  # train
+        8: 27,  # boat → watercraft
+        22: 29, # zebra
+    }
     try:
         if hasattr(model.anchor_detector, 'class_mapping'):
             if args.class_mapping in (None, 'identity'):
                 model.anchor_detector.class_mapping = None
             elif args.class_mapping == 'coco_to_bdd':
                 model.anchor_detector.class_mapping = {0: 0, 1: 7, 2: 2, 3: 6, 5: 4, 6: 5, 7: 3, 9: 8, 11: 9}
+            elif args.class_mapping == 'coco_to_vid':
+                model.anchor_detector.class_mapping = COCO_TO_VID
+                print(f"  class_mapping: coco_to_vid ({len(COCO_TO_VID)} COCO→VID class pairs)")
+        print(f"  policy_thresh: {args.policy_thresh}  max_eval: {args.max_eval or 'all'}")
     except Exception as e:
         print(f"  (note) could not set class_mapping on anchor: {e}")
     
@@ -250,7 +289,9 @@ def main():
 
     # Evaluate
     results = evaluate_cope_delta_det(model, dataset, device, policy_w1=1.0, policy_w2=1.0,
-                                      policy_thresh=0.5, num_classes=args.num_classes)
+                                      policy_thresh=args.policy_thresh,
+                                      num_classes=args.num_classes,
+                                      max_eval=args.max_eval)
 
     # Print results
     print(f"\n{'='*60}")
@@ -266,6 +307,25 @@ def main():
         for name, stats in lat.items():
             if isinstance(stats, dict):
                 print(f"  {name:20s}: {stats['mean_ms']:.2f} ms")
+
+    if args.output:
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, 'w') as f:
+            json.dump({
+                'features': args.features,
+                'dataset': args.dataset,
+                'split': args.split,
+                'class_mapping': args.class_mapping,
+                'checkpoint': args.checkpoint,
+                'policy_thresh': args.policy_thresh,
+                'max_eval': args.max_eval,
+                'yolo_weights': args.yolo_weights,
+                'mAP_50': results['mAP_50'],
+                'mAP_50_95': results['mAP_50_95'],
+                'decode_budget': results['decode_budget'],
+            }, f, indent=2)
+        print(f"\nResults saved to {out_path}")
 
 if __name__ == '__main__':
     main()

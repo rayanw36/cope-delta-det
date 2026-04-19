@@ -1,355 +1,666 @@
-"""Extract HEVC codec primitives using real codec MVs via H.264 proxy.
+"""Extract HEVC codec primitives using real codec motion vectors via PyAV.
 
-Since FFmpeg's HEVC decoder does NOT populate MOTION_VECTORS side_data,
-we use an H.264 proxy approach:
-  1. Decode the HEVC source to get raw frames
-  2. Encode frames to H.264 in-memory with matching GOP settings (ultrafast, same g=GOP)
-  3. Decode the H.264 stream with export_mvs enabled
-  4. Extract real codec MVs from side_data['MOTION_VECTORS']
+Two backends are provided:
 
-This produces genuine codec MVs (not block-matching estimates), giving the
-Delta Encoder access to the actual motion field the codec computed.
+  * `--backend h264_proxy`  (default) — transcode HEVC -> H.264 in-memory with
+    libx264 (preset=ultrafast, bf=0, matching GOP), then read real bitstream
+    motion vectors from the H.264 decoder's `MOTION_VECTORS` side data.  This
+    gives genuine codec MVs (not block-SAD estimates) on every FFmpeg build,
+    because the H.264 decoder universally supports `export_mvs`.  The MVs are
+    of course H.264's re-computed MVs rather than the original HEVC MVs, but
+    they reflect the same underlying motion.
 
-Output format is IDENTICAL to extract_features.py:
-  - mv:         (grid_h, grid_w, 2)  float32  motion vectors (dx, dy)
-  - res_energy: (grid_h, grid_w, 1)  float32  block residual energy
-  - part_depth: (grid_h, grid_w, 1)  int8     partition depth (0-3)
-  - pred_mode:  (grid_h, grid_w, 1)  int8     prediction mode (0=skip, 1=merge, 2=AMVP)
+  * `--backend hevc_direct` — read MVs directly from HEVC `side_data`.  Only
+    useful on FFmpeg builds whose HEVC decoder emits
+    `AV_FRAME_DATA_MOTION_VECTORS`; upstream FFmpeg's hevc decoder does NOT
+    as of libavcodec 62 (empirically: every P-frame yields empty side data).
+    Kept in place so that when upstream adds HEVC MV export, a one-flag switch
+    activates it.
 
-Note: Residual energy, partition depth, and prediction modes are still estimated
-from frame differences (same as block-matching version), since H.264 proxy only
-gives us MVs. The key improvement is in the MV quality.
+The other three channels (`res_energy`, `part_depth`, `pred_mode`) are computed
+from decoded luma exactly as in `extract_features.py` — those helpers are
+imported unchanged.
+
+Output NPZ schema (per frame, 720x1280 -> 45x80 grid):
+  mv          (45, 80, 2)  float32  (dx, dy) in pixel units
+  res_energy  (45, 80, 1)  float32
+  part_depth  (45, 80, 1)  int8
+  pred_mode   (45, 80, 1)  int8
 """
 
-import os
-import io
-import numpy as np
 import argparse
-from pathlib import Path
-import time
+import os
+import sys
 import tempfile
 import threading
+import time
+from pathlib import Path
 from queue import Queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import av
+import numpy as np
+
+try:
+    import av
+    HAS_PYAV = True
+except ImportError:
+    HAS_PYAV = False
+
 import torch
-import torch.nn.functional as F
+
+sys.path.insert(0, str(Path(__file__).parent))
+from extract_features import (  # noqa: E402
+    compute_residual_energy_gpu,
+    compute_partition_depth_gpu,
+    compute_pred_mode_gpu,
+)
 
 
-# ─── MV Extraction from H.264 side_data ─────────────────────────────────────
+# FFmpeg AV_CODEC_FLAG2_EXPORT_MVS = 1 << 28
+FLAG2_EXPORT_MVS = 1 << 28
 
-def mvs_side_data_to_dense(mv_array, grid_h, grid_w, block_size=16):
-    """Convert sparse MV side_data entries to a dense (grid_h, grid_w, 2) map.
 
-    mv_array is a structured numpy array with fields:
-        source, w, h, src_x, src_y, dst_x, dst_y, flags, motion_x, motion_y, motion_scale
+# --- side_data -> grid projection ------------------------------------------
 
-    We aggregate MVs into a block_size grid by averaging all MVs that fall
-    within each grid cell. motion_x/motion_y are in quarter-pel units
-    (divide by motion_scale for pixel units).
+def _project_mv_entries_to_grid(mvs, frame_h, frame_w, grid_h=45, grid_w=80,
+                                dst_is_topleft=False, flip_sign=False):
+    """Area-weighted projection of variable-size MV entries onto a fixed grid.
+
+    Works identically for H.264 and HEVC side_data — both codecs use the
+    same AVMotionVector struct.
     """
-    mv_map = np.zeros((grid_h, grid_w, 2), dtype=np.float32)
-    mv_count = np.zeros((grid_h, grid_w), dtype=np.float32)
+    cell_h = frame_h / float(grid_h)
+    cell_w = frame_w / float(grid_w)
+    out_zero = np.zeros((grid_h, grid_w, 2), dtype=np.float32)
 
-    if mv_array is None or len(mv_array) == 0:
-        return mv_map
+    if mvs is None or len(mvs) == 0:
+        return out_zero
 
-    # Filter to forward-predicted MVs only (source=-1 means future ref)
-    # source >= 0 means past reference frame
-    src = mv_array['source']
-    mask = src >= 0
-    if not mask.any():
-        # Fall back to all MVs if no forward ones
-        mask = np.ones(len(mv_array), dtype=bool)
+    # Forward-only (source == -1).  With bf=0 there is no backward prediction,
+    # but filter anyway for safety.
+    mask = mvs['source'] == -1
+    mvs = mvs[mask]
+    if len(mvs) == 0:
+        return out_zero
 
-    filtered = mv_array[mask]
+    scales = mvs['motion_scale'].astype(np.float64)
+    scales = np.where(scales > 0, scales, 1.0)
+    mx = mvs['motion_x'].astype(np.float64) / scales
+    my = mvs['motion_y'].astype(np.float64) / scales
+    if flip_sign:
+        mx = -mx
+        my = -my
 
-    # Get pixel-unit motion vectors
-    scale = filtered['motion_scale'].astype(np.float32)
-    scale[scale == 0] = 1  # Avoid division by zero
-    mx = filtered['motion_x'].astype(np.float32) / scale
-    my = filtered['motion_y'].astype(np.float32) / scale
+    bws = mvs['w'].astype(np.int32)
+    bhs = mvs['h'].astype(np.int32)
+    if dst_is_topleft:
+        bxs = mvs['dst_x'].astype(np.int32)
+        bys = mvs['dst_y'].astype(np.int32)
+    else:
+        bxs = mvs['dst_x'].astype(np.int32) - (bws // 2)
+        bys = mvs['dst_y'].astype(np.int32) - (bhs // 2)
 
-    # dst_x, dst_y is the position of the block in the current frame
-    dst_x = filtered['dst_x'].astype(np.int32)
-    dst_y = filtered['dst_y'].astype(np.int32)
-    bw = filtered['w'].astype(np.int32)
-    bh = filtered['h'].astype(np.int32)
+    mv_sum = np.zeros((grid_h, grid_w, 2), dtype=np.float64)
+    mv_wt = np.zeros((grid_h, grid_w), dtype=np.float64)
 
-    # Map each MV to the grid cell(s) it covers
-    for i in range(len(filtered)):
-        # Center of the block
-        cx = dst_x[i] + bw[i] // 2
-        cy = dst_y[i] + bh[i] // 2
+    for mvx, mvy, bx, by, bw, bh in zip(mx, my, bxs, bys, bws, bhs):
+        bx0 = max(0, int(bx))
+        by0 = max(0, int(by))
+        bx1 = min(frame_w, int(bx) + int(bw))
+        by1 = min(frame_h, int(by) + int(bh))
+        if bx1 <= bx0 or by1 <= by0:
+            continue
 
-        gx = cx // block_size
-        gy = cy // block_size
+        gy_start = max(0, int(by0 / cell_h))
+        gx_start = max(0, int(bx0 / cell_w))
+        gy_end = min(grid_h, int(np.ceil(by1 / cell_h)))
+        gx_end = min(grid_w, int(np.ceil(bx1 / cell_w)))
 
-        if 0 <= gy < grid_h and 0 <= gx < grid_w:
-            mv_map[gy, gx, 0] += mx[i]
-            mv_map[gy, gx, 1] += my[i]
-            mv_count[gy, gx] += 1
+        for gy in range(gy_start, gy_end):
+            cy0 = gy * cell_h
+            cy1 = cy0 + cell_h
+            oy = min(by1, cy1) - max(by0, cy0)
+            if oy <= 0:
+                continue
+            for gx in range(gx_start, gx_end):
+                cx0 = gx * cell_w
+                cx1 = cx0 + cell_w
+                ox = min(bx1, cx1) - max(bx0, cx0)
+                if ox <= 0:
+                    continue
+                w = ox * oy
+                mv_sum[gy, gx, 0] += mvx * w
+                mv_sum[gy, gx, 1] += mvy * w
+                mv_wt[gy, gx] += w
 
-    # Average where we had multiple MVs per cell
-    valid = mv_count > 0
-    mv_map[valid, 0] /= mv_count[valid]
-    mv_map[valid, 1] /= mv_count[valid]
-
-    return mv_map
-
-
-# ─── GPU-based residual/depth/mode estimation ───────────────────────────────
-
-def compute_residual_energy_gpu(prev_gray_t, curr_gray_t, block_size=16):
-    """Block-wise residual energy on GPU."""
-    diff_sq = torch.abs(curr_gray_t - prev_gray_t) ** 2
-    t = diff_sq.unsqueeze(0).unsqueeze(0)
-    block_sum = F.avg_pool2d(t, kernel_size=block_size, stride=block_size) * (block_size ** 2)
-    energy = torch.sqrt(block_sum).squeeze()
-    return energy
-
-
-def compute_partition_depth_gpu(mv_mag, grid_h, grid_w):
-    """Estimate partition depth from local MV variance."""
-    mag_pad = F.pad(mv_mag.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1), mode='replicate')
-    mean_x = F.avg_pool2d(mag_pad, kernel_size=3, stride=1, padding=0)
-    mean_x2 = F.avg_pool2d(mag_pad ** 2, kernel_size=3, stride=1, padding=0)
-    local_var = (mean_x2 - mean_x ** 2).squeeze()
-
-    depth = torch.zeros_like(local_var, dtype=torch.int8)
-    depth[local_var >= 1.0] = 1
-    depth[local_var >= 5.0] = 2
-    depth[local_var >= 20.0] = 3
-    return depth
+    nz = mv_wt > 0
+    out = np.zeros((grid_h, grid_w, 2), dtype=np.float32)
+    out[nz, 0] = (mv_sum[nz, 0] / mv_wt[nz]).astype(np.float32)
+    out[nz, 1] = (mv_sum[nz, 1] / mv_wt[nz]).astype(np.float32)
+    return out
 
 
-def compute_pred_mode_gpu(mv_mag, res_energy):
-    """Estimate prediction mode from MV magnitude and residual energy."""
-    mode = torch.full_like(mv_mag, 2, dtype=torch.int8)  # Default: AMVP
-    mode[mv_mag < 2.0] = 1   # Merge-like
-    mode[(mv_mag < 0.5) & (res_energy < 10.0)] = 0  # Skip
-    return mode
+def extract_real_mvs_single_frame(frame, grid_h=45, grid_w=80,
+                                  frame_h=720, frame_w=1280,
+                                  flip_sign=False, dst_is_topleft=False):
+    """Return (grid_h, grid_w, 2) MV grid for one decoded PyAV frame.
 
-
-# ─── H.264 Proxy MV Extraction Pipeline ─────────────────────────────────────
-
-def extract_h264_proxy_mvs(video_path, gop_size=16):
-    """Decode HEVC video, re-encode to H.264, extract real codec MVs.
-
-    Returns:
-        frames_gray: list of numpy arrays (H, W) uint8 grayscale frames
-        frame_mvs:   list of (grid_h, grid_w, 2) float32 MV maps (None for I-frames)
-        frame_types: list of str ('I', 'P', 'B')
+    I-frames and frames without MV side data yield all-zeros.
     """
-    # Step 1: Decode HEVC source to raw frames
-    container_in = av.open(str(video_path))
-    stream_in = container_in.streams.video[0]
-    height = stream_in.codec_context.height
-    width = stream_in.codec_context.width
-    grid_h = height // 16
-    grid_w = width // 16
-
-    raw_frames = []
-    for frame in container_in.decode(stream_in):
-        raw_frames.append(frame)
-    container_in.close()
-
-    if not raw_frames:
-        return [], [], []
-
-    # Step 2: Encode to H.264 temp file with matching GOP
-    tmp_path = tempfile.mktemp(suffix='.h264')
+    side = frame.side_data.get('MOTION_VECTORS')
+    if side is None:
+        return np.zeros((grid_h, grid_w, 2), dtype=np.float32)
     try:
-        container_out = av.open(tmp_path, mode='w', format='h264')
-        stream_out = container_out.add_stream('libx264', rate=30)
-        stream_out.width = width
-        stream_out.height = height
-        stream_out.pix_fmt = 'yuv420p'
-        stream_out.options = {
+        mvs = side.to_ndarray()
+    except Exception:
+        return np.zeros((grid_h, grid_w, 2), dtype=np.float32)
+    return _project_mv_entries_to_grid(
+        mvs, frame_h=frame_h, frame_w=frame_w,
+        grid_h=grid_h, grid_w=grid_w,
+        dst_is_topleft=dst_is_topleft, flip_sign=flip_sign,
+    )
+
+
+# --- HEVC direct backend ---------------------------------------------------
+
+def open_hevc_with_mvs(video_path):
+    """Open an HEVC file with `export_mvs` enabled."""
+    container = av.open(str(video_path))
+    stream = container.streams.video[0]
+    try:
+        stream.thread_type = 'NONE'
+        stream.thread_count = 1
+    except Exception:
+        pass
+    ctx = stream.codec_context
+    try:
+        ctx.options = {'flags2': '+export_mvs'}
+    except Exception:
+        pass
+    try:
+        ctx.flags2 = ctx.flags2 | FLAG2_EXPORT_MVS
+    except Exception:
+        pass
+    return container, stream
+
+
+def extract_real_mvs_for_frame_idx(hevc_path, frame_idx,
+                                   grid_h=45, grid_w=80,
+                                   flip_sign=False, dst_is_topleft=False,
+                                   backend='h264_proxy', gop_size=16):
+    """Stand-alone helper for the validator — returns the MV grid for one frame.
+
+    For `h264_proxy` backend this transcodes the whole video to a temp H.264
+    file (expensive) and then decodes up to `frame_idx`.  For repeated calls on
+    the same video the caller should instead batch frames through
+    `iter_proxy_mvs_for_frames`.
+    """
+    if backend == 'hevc_direct':
+        container, stream = open_hevc_with_mvs(hevc_path)
+        fh = stream.codec_context.height
+        fw = stream.codec_context.width
+        mv = None
+        try:
+            for idx, frame in enumerate(container.decode(stream)):
+                if idx == frame_idx:
+                    mv = extract_real_mvs_single_frame(
+                        frame, grid_h=grid_h, grid_w=grid_w,
+                        frame_h=fh, frame_w=fw,
+                        flip_sign=flip_sign, dst_is_topleft=dst_is_topleft,
+                    )
+                    break
+        finally:
+            container.close()
+        return mv if mv is not None else np.zeros((grid_h, grid_w, 2), dtype=np.float32)
+
+    # h264_proxy
+    results = iter_proxy_mvs_for_frames(
+        hevc_path, [frame_idx],
+        grid_h=grid_h, grid_w=grid_w,
+        flip_sign=flip_sign, dst_is_topleft=dst_is_topleft,
+        gop_size=gop_size,
+    )
+    return results.get(frame_idx, np.zeros((grid_h, grid_w, 2), dtype=np.float32))
+
+
+# --- H.264 proxy backend ---------------------------------------------------
+
+def _pick_h264_encoder():
+    """Return 'h264_nvenc' if available on this machine, else 'libx264'.
+
+    h264_nvenc is ~5-10x faster than libx264 for the ultrafast re-encode step
+    and is available whenever an NVIDIA GPU and the matching FFmpeg build are
+    present.  The output is still decoded by the software H.264 decoder, which
+    exports MVs normally.
+    """
+    try:
+        av.Codec('h264_nvenc', 'w')
+        return 'h264_nvenc'
+    except Exception:
+        return 'libx264'
+
+
+_H264_ENCODER = _pick_h264_encoder()
+
+
+def _transcode_hevc_to_h264(hevc_path, h264_path, gop_size=16, encoder=None):
+    """Decode HEVC and re-encode to H.264 (bf=0, matching GOP).
+
+    Uses h264_nvenc by default when available (GPU-accelerated; ~5-10x faster
+    than libx264 ultrafast), otherwise falls back to libx264.  The H.264
+    decoder fully supports `export_mvs` regardless of which encoder was used.
+    """
+    enc = encoder or _H264_ENCODER
+    cin = av.open(str(hevc_path))
+    sin = cin.streams.video[0]
+    width = sin.codec_context.width
+    height = sin.codec_context.height
+    rate = sin.average_rate or 30
+
+    cout = av.open(str(h264_path), mode='w', format='h264')
+    sout = cout.add_stream(enc, rate=rate)
+    sout.width = width
+    sout.height = height
+    sout.pix_fmt = 'yuv420p'
+
+    if enc == 'h264_nvenc':
+        sout.options = {
+            'preset': 'p1',          # fastest NVENC preset (low quality, fine for MV)
+            'g': str(gop_size),
+            'bf': '0',               # no B-frames
+            'rc': 'constqp',
+            'qp': '28',
+        }
+    else:
+        sout.options = {
             'preset': 'ultrafast',
             'g': str(gop_size),
-            'sc_threshold': '0',  # No scene-cut to match HEVC GOP structure
-            'bf': '0',  # No B-frames for simpler MV extraction
+            'keyint_min': str(gop_size),
+            'sc_threshold': '0',
+            'bf': '0',
+            'tune': 'zerolatency',
         }
 
-        for raw_frame in raw_frames:
-            # Convert to yuv420p for H.264 encoding
-            yuv_frame = raw_frame.reformat(format='yuv420p')
-            for packet in stream_out.encode(yuv_frame):
-                container_out.mux(packet)
-
-        # Flush encoder
-        for packet in stream_out.encode():
-            container_out.mux(packet)
-        container_out.close()
-
-        # Step 3: Decode H.264 with export_mvs enabled
-        container_mv = av.open(tmp_path)
-        stream_mv = container_mv.streams.video[0]
-        stream_mv.codec_context.options = {'flags2': '+export_mvs'}
-
-        frames_gray = []
-        frame_mvs = []
-        frame_types = []
-
-        for frame in container_mv.decode(stream_mv):
-            # Get grayscale
-            gray = frame.to_ndarray(format='gray').squeeze()
-            frames_gray.append(gray)
-
-            # Get frame type
-            ptype = frame.pict_type
-            if isinstance(ptype, int):
-                ftype = {1: 'I', 2: 'P', 3: 'B'}.get(ptype, 'P')
-            else:
-                ftype = getattr(ptype, 'name', 'P')
-            frame_types.append(ftype)
-
-            # Extract MVs from side_data
-            sd = frame.side_data
-            if sd and 'MOTION_VECTORS' in sd:
-                mv_data = sd['MOTION_VECTORS'].to_ndarray()
-                mv_dense = mvs_side_data_to_dense(mv_data, grid_h, grid_w, block_size=16)
-                frame_mvs.append(mv_dense)
-            else:
-                frame_mvs.append(None)
-
-        container_mv.close()
-
+    n_frames = 0
+    try:
+        for frame in cin.decode(sin):
+            yuv = frame.reformat(format='yuv420p')
+            yuv.pts = n_frames
+            for packet in sout.encode(yuv):
+                cout.mux(packet)
+            n_frames += 1
+        for packet in sout.encode():
+            cout.mux(packet)
     finally:
-        # Clean up temp file
-        if os.path.exists(tmp_path):
+        cout.close()
+        cin.close()
+    return n_frames, width, height
+
+
+def _open_h264_with_mvs(h264_path):
+    """Open the transcoded H.264 file with `export_mvs` enabled."""
+    container = av.open(str(h264_path))
+    stream = container.streams.video[0]
+    try:
+        stream.thread_type = 'NONE'
+        stream.thread_count = 1
+    except Exception:
+        pass
+    ctx = stream.codec_context
+    try:
+        ctx.options = {'flags2': '+export_mvs'}
+    except Exception:
+        pass
+    try:
+        ctx.flags2 = ctx.flags2 | FLAG2_EXPORT_MVS
+    except Exception:
+        pass
+    return container, stream
+
+
+def iter_proxy_mvs_for_frames(hevc_path, frame_indices,
+                              grid_h=None, grid_w=None,
+                              flip_sign=False, dst_is_topleft=False,
+                              gop_size=16, block_size=16, encoder=None):
+    """H.264-proxy MV extraction for a specific set of frame indices.
+
+    Transcodes `hevc_path` to a temp H.264 file (ultrafast libx264, bf=0,
+    matching GOP), decodes it with export_mvs, and returns a dict
+    {frame_idx: (grid_h, grid_w, 2) float32} for the requested indices.
+
+    If `grid_h`/`grid_w` are None they are inferred from the actual stream
+    dimensions as `height // block_size` / `width // block_size`.
+    """
+    wanted = set(int(i) for i in frame_indices)
+    if not wanted:
+        return {}
+    results = {}
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.h264')
+    os.close(tmp_fd)
+    try:
+        _transcode_hevc_to_h264(hevc_path, tmp_path, gop_size=gop_size, encoder=encoder)
+        container, stream = _open_h264_with_mvs(tmp_path)
+        fh = stream.codec_context.height
+        fw = stream.codec_context.width
+        gh = grid_h if grid_h is not None else fh // block_size
+        gw = grid_w if grid_w is not None else fw // block_size
+        try:
+            for idx, frame in enumerate(container.decode(stream)):
+                if idx in wanted:
+                    results[idx] = extract_real_mvs_single_frame(
+                        frame, grid_h=gh, grid_w=gw,
+                        frame_h=fh, frame_w=fw,
+                        flip_sign=flip_sign, dst_is_topleft=dst_is_topleft,
+                    )
+                if len(results) == len(wanted):
+                    break
+        finally:
+            container.close()
+    finally:
+        try:
             os.remove(tmp_path)
+        except OSError:
+            pass
+    return results
 
-    return frames_gray, frame_mvs, frame_types
+
+# --- per-video processing --------------------------------------------------
+
+def _save_thread(save_q, stop_event):
+    while not stop_event.is_set():
+        item = save_q.get()
+        if item is None:
+            break
+        path, arrays = item
+        np.savez(path, **arrays)
 
 
-# ─── Full Video Processing ───────────────────────────────────────────────────
+def _process_video_hevc_direct(video_path, output_dir, device='cuda',
+                               dst_is_topleft=False, flip_sign=False,
+                               skip_existing=True):
+    stem = Path(video_path).stem
+    vid_out = Path(output_dir) / stem
+    if skip_existing and vid_out.exists() and len(list(vid_out.glob('*.npz'))) > 100:
+        return
+    vid_out.mkdir(parents=True, exist_ok=True)
 
-def process_video_features(video_path, output_dir, device='cuda', gop_size=16):
-    """Extract features from a single video using H.264 proxy MVs + GPU residuals."""
-    base_name = Path(video_path).stem
-    vid_output_dir = Path(output_dir) / base_name
-
-    # Skip if already extracted
-    if vid_output_dir.exists():
-        existing = len(list(vid_output_dir.glob("*.npz")))
-        if existing > 100:
-            return
-    vid_output_dir.mkdir(parents=True, exist_ok=True)
-
-    t_start = time.time()
-
-    # Extract H.264 proxy MVs for ALL frames
     try:
-        frames_gray, frame_mvs, frame_types = extract_h264_proxy_mvs(
-            video_path, gop_size=gop_size
-        )
+        container, stream = open_hevc_with_mvs(video_path)
     except Exception as e:
-        print(f"  Error extracting MVs from {video_path}: {e}")
+        print(f"  Error opening {video_path}: {e}")
         return
+    fh = stream.codec_context.height
+    fw = stream.codec_context.width
+    grid_h = fh // 16
+    grid_w = fw // 16
+    if not (fw == 1280 and fh == 720):
+        print(f"  WARN: {stem} dims {fw}x{fh}; expected 1280x720")
 
-    num_frames = len(frames_gray)
-    if num_frames == 0:
-        print(f"  No frames decoded from {video_path}")
-        return
+    save_q = Queue(maxsize=16)
+    stop_event = threading.Event()
+    saver = threading.Thread(target=_save_thread, args=(save_q, stop_event), daemon=True)
+    saver.start()
 
-    height, width = frames_gray[0].shape
-    grid_h = height // 16
-    grid_w = width // 16
-
-    # Process each frame: combine H.264 MVs with GPU-computed residuals
     prev_gray_t = None
-
-    for idx in range(num_frames):
-        gray_t = torch.from_numpy(frames_gray[idx].astype(np.float32)).to(device)
-
-        # Get MV map (from H.264 proxy or zeros for I-frames)
-        if frame_mvs[idx] is not None:
-            mv_np = frame_mvs[idx]
-        else:
-            mv_np = np.zeros((grid_h, grid_w, 2), dtype=np.float32)
-
-        # Compute residual features on GPU
-        if prev_gray_t is not None and frame_types[idx] != 'I':
-            res_energy = compute_residual_energy_gpu(prev_gray_t, gray_t, block_size=16)
-
-            mv_t = torch.from_numpy(mv_np).to(device)
-            mv_mag = torch.sqrt(mv_t[:, :, 0] ** 2 + mv_t[:, :, 1] ** 2)
-
-            part_depth = compute_partition_depth_gpu(mv_mag, grid_h, grid_w)
-            pred_mode = compute_pred_mode_gpu(mv_mag, res_energy)
-
-            res_np = res_energy.unsqueeze(-1).cpu().numpy()
-            depth_np = part_depth.unsqueeze(-1).cpu().numpy()
-            mode_np = pred_mode.unsqueeze(-1).cpu().numpy()
-        else:
-            # I-frame: zero features
-            res_np = np.zeros((grid_h, grid_w, 1), dtype=np.float32)
-            depth_np = np.zeros((grid_h, grid_w, 1), dtype=np.int8)
-            mode_np = np.full((grid_h, grid_w, 1), 3, dtype=np.int8)
-
-        # Save
-        save_path = str(vid_output_dir / f"frame_{idx:04d}.npz")
-        np.savez(save_path,
-                 mv=mv_np,
-                 res_energy=res_np,
-                 part_depth=depth_np,
-                 pred_mode=mode_np)
-
-        prev_gray_t = gray_t
-
-        if (idx + 1) % 200 == 0:
-            elapsed = time.time() - t_start
-            fps = (idx + 1) / elapsed
-            print(f"    {idx + 1}/{num_frames} frames ({fps:.1f} fps)...")
-
-    elapsed = time.time() - t_start
-    fps = num_frames / elapsed if elapsed > 0 else 0
-    print(f"  {base_name}: {num_frames} frames in {elapsed:.1f}s ({fps:.1f} fps)")
-
-
-def process_video_wrapper(args):
-    """Wrapper for thread pool."""
-    video_path, output_dir, device, gop_size = args
+    frame_count = 0
+    p_frames = 0
+    p_with_mvs = 0
+    t0 = time.time()
     try:
-        process_video_features(video_path, output_dir, device=device, gop_size=gop_size)
+        for idx, frame in enumerate(container.decode(stream)):
+            ptype = frame.pict_type
+            ftype = ({1: 'I', 2: 'P', 3: 'B'}.get(ptype, 'P')
+                     if isinstance(ptype, int) else getattr(ptype, 'name', 'P'))
+            gray_np = frame.to_ndarray(format='gray').squeeze()
+            gray_t = torch.from_numpy(gray_np.astype(np.float32)).to(device, non_blocking=True)
+
+            if ftype == 'I' or prev_gray_t is None:
+                mv_np = np.zeros((grid_h, grid_w, 2), dtype=np.float32)
+                res_np = np.zeros((grid_h, grid_w, 1), dtype=np.float32)
+                depth_np = np.zeros((grid_h, grid_w, 1), dtype=np.int8)
+                mode_np = np.full((grid_h, grid_w, 1), 3, dtype=np.int8)
+            else:
+                p_frames += 1
+                mv_np = extract_real_mvs_single_frame(
+                    frame, grid_h=grid_h, grid_w=grid_w, frame_h=fh, frame_w=fw,
+                    flip_sign=flip_sign, dst_is_topleft=dst_is_topleft)
+                if np.any(mv_np != 0):
+                    p_with_mvs += 1
+                res = compute_residual_energy_gpu(prev_gray_t, gray_t, block_size=16)
+                mv_mag = torch.from_numpy(
+                    np.sqrt(mv_np[..., 0] ** 2 + mv_np[..., 1] ** 2)
+                ).to(device, non_blocking=True)
+                part = compute_partition_depth_gpu(mv_mag, grid_h, grid_w)
+                mode = compute_pred_mode_gpu(mv_mag, res)
+                res_np = res.unsqueeze(-1).cpu().numpy()
+                depth_np = part.unsqueeze(-1).cpu().numpy()
+                mode_np = mode.unsqueeze(-1).cpu().numpy()
+
+            save_q.put((str(vid_out / f'frame_{idx:04d}.npz'), {
+                'mv': mv_np.astype(np.float32),
+                'res_energy': res_np.astype(np.float32),
+                'part_depth': depth_np.astype(np.int8),
+                'pred_mode': mode_np.astype(np.int8),
+            }))
+            prev_gray_t = gray_t
+            frame_count += 1
+    finally:
+        save_q.put(None)
+        saver.join()
+        stop_event.set()
+        container.close()
+
+    elapsed = time.time() - t0
+    fps = frame_count / elapsed if elapsed > 0 else 0.0
+    frac = (p_with_mvs / p_frames) if p_frames else 0.0
+    print(f"  {stem}: {frame_count} frames in {elapsed:.1f}s ({fps:.1f} fps) "
+          f"[hevc_direct] P-frames with MVs: {p_with_mvs}/{p_frames} ({frac*100:.1f}%)")
+    if p_frames > 0 and p_with_mvs == 0:
+        print(f"  NOTE: no HEVC MV side-data. Use --backend h264_proxy "
+              f"on FFmpeg builds without HEVC export_mvs.")
+
+
+def _process_video_h264_proxy(video_path, output_dir, device='cuda',
+                              dst_is_topleft=False, flip_sign=False,
+                              skip_existing=True, gop_size=16, encoder=None):
+    """Transcode HEVC -> H.264 (libx264 bf=0 g=gop_size), extract MVs from H.264.
+
+    For the non-MV channels we use the luma of the *H.264-decoded* frames.
+    Those are a one-generation re-encode of the HEVC reconstruction, so the
+    residual energy differs slightly from using the original HEVC luma, but
+    the pipeline stays simple (one decode, not two) and the approximation
+    quality is comparable to the block-matched reference.
+    """
+    stem = Path(video_path).stem
+    vid_out = Path(output_dir) / stem
+    if skip_existing and vid_out.exists() and len(list(vid_out.glob('*.npz'))) > 100:
+        return
+    vid_out.mkdir(parents=True, exist_ok=True)
+
+    t0 = time.time()
+
+    # Step 1: transcode to temp H.264
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.h264')
+    os.close(tmp_fd)
+
+    frame_count = 0
+    p_frames = 0
+    p_with_mvs = 0
+
+    try:
+        try:
+            n_in, width, height = _transcode_hevc_to_h264(
+                video_path, tmp_path, gop_size=gop_size, encoder=encoder)
+        except Exception as e:
+            print(f"  Error transcoding {video_path}: {e}")
+            return
+        if not (width == 1280 and height == 720):
+            print(f"  WARN: {stem} dims {width}x{height}; expected 1280x720")
+        grid_h = height // 16
+        grid_w = width // 16
+
+        # Step 2: decode H.264 with MV export, pipeline GPU + save
+        container, stream = _open_h264_with_mvs(tmp_path)
+        save_q = Queue(maxsize=16)
+        stop_event = threading.Event()
+        saver = threading.Thread(target=_save_thread, args=(save_q, stop_event), daemon=True)
+        saver.start()
+
+        prev_gray_t = None
+        try:
+            for idx, frame in enumerate(container.decode(stream)):
+                ptype = frame.pict_type
+                ftype = ({1: 'I', 2: 'P', 3: 'B'}.get(ptype, 'P')
+                         if isinstance(ptype, int) else getattr(ptype, 'name', 'P'))
+                gray_np = frame.to_ndarray(format='gray').squeeze()
+                gray_t = torch.from_numpy(gray_np.astype(np.float32)).to(device, non_blocking=True)
+
+                if ftype == 'I' or prev_gray_t is None:
+                    mv_np = np.zeros((grid_h, grid_w, 2), dtype=np.float32)
+                    res_np = np.zeros((grid_h, grid_w, 1), dtype=np.float32)
+                    depth_np = np.zeros((grid_h, grid_w, 1), dtype=np.int8)
+                    mode_np = np.full((grid_h, grid_w, 1), 3, dtype=np.int8)
+                else:
+                    p_frames += 1
+                    mv_np = extract_real_mvs_single_frame(
+                        frame, grid_h=grid_h, grid_w=grid_w,
+                        frame_h=height, frame_w=width,
+                        flip_sign=flip_sign, dst_is_topleft=dst_is_topleft)
+                    if np.any(mv_np != 0):
+                        p_with_mvs += 1
+                    res = compute_residual_energy_gpu(prev_gray_t, gray_t, block_size=16)
+                    mv_mag = torch.from_numpy(
+                        np.sqrt(mv_np[..., 0] ** 2 + mv_np[..., 1] ** 2)
+                    ).to(device, non_blocking=True)
+                    part = compute_partition_depth_gpu(mv_mag, grid_h, grid_w)
+                    mode = compute_pred_mode_gpu(mv_mag, res)
+                    res_np = res.unsqueeze(-1).cpu().numpy()
+                    depth_np = part.unsqueeze(-1).cpu().numpy()
+                    mode_np = mode.unsqueeze(-1).cpu().numpy()
+
+                save_q.put((str(vid_out / f'frame_{idx:04d}.npz'), {
+                    'mv': mv_np.astype(np.float32),
+                    'res_energy': res_np.astype(np.float32),
+                    'part_depth': depth_np.astype(np.int8),
+                    'pred_mode': mode_np.astype(np.int8),
+                }))
+                prev_gray_t = gray_t
+                frame_count += 1
+        finally:
+            save_q.put(None)
+            saver.join()
+            stop_event.set()
+            container.close()
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    elapsed = time.time() - t0
+    fps = frame_count / elapsed if elapsed > 0 else 0.0
+    frac = (p_with_mvs / p_frames) if p_frames else 0.0
+    enc_used = encoder or _H264_ENCODER
+    print(f"  {stem}: {frame_count} frames in {elapsed:.1f}s ({fps:.1f} fps) "
+          f"[h264_proxy/{enc_used}] P-frames with MVs: {p_with_mvs}/{p_frames} ({frac*100:.1f}%)")
+
+
+def process_video_features_pyav(video_path, output_dir, device='cuda',
+                                dst_is_topleft=False, flip_sign=False,
+                                skip_existing=True, backend='h264_proxy',
+                                gop_size=16, encoder=None):
+    if not HAS_PYAV:
+        print(f"  PyAV not installed, skipping {video_path}")
+        return
+    if backend == 'hevc_direct':
+        _process_video_hevc_direct(
+            video_path, output_dir, device=device,
+            dst_is_topleft=dst_is_topleft, flip_sign=flip_sign,
+            skip_existing=skip_existing)
+    elif backend == 'h264_proxy':
+        _process_video_h264_proxy(
+            video_path, output_dir, device=device,
+            dst_is_topleft=dst_is_topleft, flip_sign=flip_sign,
+            skip_existing=skip_existing, gop_size=gop_size, encoder=encoder)
+    else:
+        raise ValueError(f'Unknown backend: {backend!r}')
+
+
+# --- multi-video driver ----------------------------------------------------
+
+def _worker(args):
+    (video_path, out_dir, device, dst_is_topleft, flip_sign,
+     skip_existing, backend, gop_size, encoder) = args
+    try:
+        process_video_features_pyav(
+            video_path, out_dir, device=device,
+            dst_is_topleft=dst_is_topleft, flip_sign=flip_sign,
+            skip_existing=skip_existing, backend=backend,
+            gop_size=gop_size, encoder=encoder)
     except Exception as e:
-        print(f"  ERROR processing {Path(video_path).stem}: {e}")
+        print(f"  ERROR {Path(video_path).stem}: {e}")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Extract features using H.264 proxy MVs (real codec MVs)"
-    )
-    parser.add_argument("--hevc_dir", default="./data/bdd100k/hevc")
-    parser.add_argument("--output_dir", default="./data/bdd100k/features_pyav")
-    parser.add_argument("--configs", type=str, nargs="+", default=[],
-                        help="Specific configs to process, e.g. 'qp22_gop16'")
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--workers", type=int, default=1,
-                        help="Concurrent videos (default 1 — H.264 proxy is more memory-intensive)")
-    parser.add_argument("--gop_size", type=int, default=16,
-                        help="GOP size for H.264 proxy encoding (should match HEVC GOP)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--hevc_dir', default='./data/imagenetvid/hevc')
+    parser.add_argument('--output_dir', default='./data/imagenetvid/features_pyav')
+    parser.add_argument('--configs', type=str, nargs='+', default=[])
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--workers', type=int, default=3)
+    parser.add_argument('--backend', type=str, default='h264_proxy',
+                        choices=['h264_proxy', 'hevc_direct'],
+                        help='MV source: H.264 proxy transcode (default, always works) '
+                             'or direct HEVC side_data (requires FFmpeg HEVC MV support).')
+    parser.add_argument('--gop_size', type=int, default=16,
+                        help='GOP size for H.264 proxy re-encode (match HEVC source).')
+    parser.add_argument('--single_video', type=str, default=None,
+                        help='Process only this specific HEVC file (smoke-test).')
+    parser.add_argument('--flip_sign', action='store_true',
+                        help='Negate MVs before projection.')
+    parser.add_argument('--dst_is_topleft', action='store_true',
+                        help='Treat dst_x/dst_y as top-left rather than center.')
+    parser.add_argument('--no_skip_existing', action='store_true',
+                        help='Re-extract even if NPZ dir already exists.')
+    parser.add_argument('--encoder', type=str, default=None,
+                        help='H.264 encoder for proxy transcode: h264_nvenc (GPU, default '
+                             'when available) or libx264 (CPU fallback). '
+                             'Auto-detected if omitted.')
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
+    encoder = args.encoder  # None → auto-detect inside _pick_h264_encoder()
+    print(f'Using device: {device}')
     if device == 'cuda':
-        print(f"  GPU: {torch.cuda.get_device_name(0)}")
-        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-    print(f"Concurrent workers: {args.workers}")
-    print(f"H.264 proxy GOP size: {args.gop_size}")
-    print(f"NOTE: Using H.264 proxy approach for real codec MVs")
-    print(f"      (HEVC decoder does not export MVs via side_data)")
+        print(f'  GPU: {torch.cuda.get_device_name(0)}')
+    print(f'Backend: {args.backend}  (GOP={args.gop_size})')
+    print(f'H.264 encoder: {encoder or _H264_ENCODER} (auto={encoder is None})')
+    print(f'Workers: {args.workers}, flip_sign={args.flip_sign}, '
+          f'dst_is_topleft={args.dst_is_topleft}')
+
+    skip_existing = not args.no_skip_existing
+
+    if args.single_video:
+        hf = Path(args.single_video)
+        if not hf.exists():
+            print(f'File not found: {hf}')
+            return
+        config = hf.parent.name
+        out_dir = Path(args.output_dir) / config
+        out_dir.mkdir(parents=True, exist_ok=True)
+        process_video_features_pyav(
+            str(hf), str(out_dir), device=device,
+            dst_is_topleft=args.dst_is_topleft, flip_sign=args.flip_sign,
+            skip_existing=skip_existing, backend=args.backend,
+            gop_size=args.gop_size, encoder=encoder)
+        return
 
     in_dir = Path(args.hevc_dir)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
     if not in_dir.exists():
-        print(f"HEVC directory not found: {in_dir}")
+        print(f'HEVC directory not found: {in_dir}')
         return
 
     for qp_gop_dir in sorted(in_dir.iterdir()):
@@ -358,48 +669,43 @@ def main():
         if args.configs and qp_gop_dir.name not in args.configs:
             continue
 
-        print(f"\n{'='*60}")
-        print(f"Processing config: {qp_gop_dir.name}")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}\nProcessing set: {qp_gop_dir.name}\n{'='*60}")
         feat_set_dir = out_dir / qp_gop_dir.name
+        feat_set_dir.mkdir(parents=True, exist_ok=True)
 
-        hevc_files = sorted(qp_gop_dir.glob("*.hevc"))
+        hevc_files = sorted(qp_gop_dir.glob('*.hevc'))
         total = len(hevc_files)
-        print(f"  Found {total} HEVC files")
-
-        # Count already-done
+        todo = []
         done = 0
-        todo_files = []
         for hf in hevc_files:
             vdir = feat_set_dir / hf.stem
-            if vdir.exists() and len(list(vdir.glob("*.npz"))) > 100:
+            if skip_existing and vdir.exists() and len(list(vdir.glob('*.npz'))) > 100:
                 done += 1
             else:
-                todo_files.append(hf)
-
-        print(f"  Already extracted: {done}/{total}")
-        print(f"  Remaining: {len(todo_files)}")
-
-        if not todo_files:
-            print("  Nothing to do, skipping.")
+                todo.append(hf)
+        print(f'  Found {total}, already extracted {done}, remaining {len(todo)}')
+        if not todo:
             continue
 
+        tasks = [(str(hf), str(feat_set_dir), device,
+                  args.dst_is_topleft, args.flip_sign, skip_existing,
+                  args.backend, args.gop_size, encoder) for hf in todo]
+
         t0 = time.time()
-        tasks = [(str(f), str(feat_set_dir), device, args.gop_size) for f in todo_files]
+        completed = 0
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {executor.submit(_worker, t): t for t in tasks}
+            for fut in as_completed(futures):
+                completed += 1
+                elapsed = time.time() - t0
+                vph = completed / elapsed * 3600 if elapsed > 0 else 0
+                eta = (len(todo) - completed) / vph if vph > 0 else 0
+                if completed % 10 == 0 or completed == len(todo):
+                    print(f"  Progress: {completed}/{len(todo)} "
+                          f"({vph:.0f} vid/hr, ETA {eta:.1f}h)")
+        print(f'  {qp_gop_dir.name}: done in {(time.time()-t0)/3600:.1f}h')
 
-        if args.workers <= 1:
-            for task in tasks:
-                process_video_wrapper(task)
-        else:
-            with ThreadPoolExecutor(max_workers=args.workers) as pool:
-                futures = [pool.submit(process_video_wrapper, t) for t in tasks]
-                for f in as_completed(futures):
-                    f.result()
-
-        elapsed = time.time() - t0
-        print(f"\n  Config {qp_gop_dir.name} complete: {len(todo_files)} videos in {elapsed:.1f}s")
-
-    print("\nAll extraction complete.")
+    print('\nPyAV feature extraction complete.')
 
 
 if __name__ == '__main__':

@@ -23,11 +23,15 @@ from models.refresh_policy import SaliencyRefreshPolicy
 from utils.metrics import COCOMetrics, LatencyTracker, DecodeBudgetTracker
 from utils.box_utils import xyxy_to_xywh, xywh_to_xyxy
 
-def evaluate_cope_delta_det(model, dataset, device, measure_latency=True, policy_w1=1.0, policy_w2=1.0, policy_thresh=0.5, num_classes=10, max_eval=None):
+def evaluate_cope_delta_det(model, dataset, device, measure_latency=True, policy_w1=1.0, policy_w2=1.0, policy_thresh=0.5, num_classes=10, max_eval=None, ablation='full'):
     """Evaluate CoPE-Δ-Det on a dataset using the unified forward pass.
 
     Set policy_thresh >= 999 to disable the refresh policy entirely (pure CoPE,
     delta encoder runs on every P-frame, decode budget ≈ 6.25%).
+
+    ablation: 'full' = use all features (default)
+              'mv_only' = zero out residual/depth/mode; only MVs reach delta encoder
+              'appearance_only' = zero out MVs; only residual/depth/mode reach delta encoder
     """
     model.eval()
     metrics = COCOMetrics(num_classes=num_classes)
@@ -52,7 +56,15 @@ def evaluate_cope_delta_det(model, dataset, device, measure_latency=True, policy
             res = sample['pframe_res'].to(device) # [N, 1, H, W]
             depths = sample['pframe_depths'].to(device) # [N, 1, H, W]
             modes = sample['pframe_modes'].to(device) # [N, 1, H, W]
-            
+
+            # Ablation: zero out the features not under study
+            if ablation == 'mv_only':
+                res = torch.zeros_like(res)
+                depths = torch.zeros_like(depths)
+                modes = torch.zeros_like(modes)
+            elif ablation == 'appearance_only':
+                mvs = torch.zeros_like(mvs)
+
             targets = sample['targets'] # List of dicts
             num_pframes = mvs.shape[0]
             
@@ -206,6 +218,11 @@ def main():
                         help='Saliency refresh threshold. Set to 999 to disable (pure CoPE, no refresh).')
     parser.add_argument('--max_eval', type=int, default=None,
                         help='Max GOPs to evaluate (default: all)')
+    parser.add_argument('--ablation', type=str, default='full',
+                        choices=['full', 'mv_only', 'appearance_only'],
+                        help='Ablation mode: full=all features (default), '
+                             'mv_only=zero residual/depth/mode keep MVs, '
+                             'appearance_only=zero MVs keep residual/depth/mode')
     args = parser.parse_args()
 
     # Dataset-specific defaults
@@ -288,10 +305,13 @@ def main():
     )
 
     # Evaluate
+    if args.ablation != 'full':
+        print(f"  ablation: {args.ablation}")
     results = evaluate_cope_delta_det(model, dataset, device, policy_w1=1.0, policy_w2=1.0,
                                       policy_thresh=args.policy_thresh,
                                       num_classes=args.num_classes,
-                                      max_eval=args.max_eval)
+                                      max_eval=args.max_eval,
+                                      ablation=args.ablation)
 
     # Print results
     print(f"\n{'='*60}")
@@ -320,6 +340,7 @@ def main():
                 'checkpoint': args.checkpoint,
                 'policy_thresh': args.policy_thresh,
                 'max_eval': args.max_eval,
+                'ablation': args.ablation,
                 'yolo_weights': args.yolo_weights,
                 'mAP_50': results['mAP_50'],
                 'mAP_50_95': results['mAP_50_95'],

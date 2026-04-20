@@ -192,6 +192,10 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers', type=int, default=8,
                         help="Dataloader workers (higher = more I/O overlap)")
     parser.add_argument('--gop_length', type=int, default=16)
+    parser.add_argument('--lr', type=float, default=1e-4,
+                        help='Peak learning rate (default 1e-4). Set lower, e.g. 5e-5, '
+                             'when resuming a converged model to avoid the optimizer '
+                             'cold-start spike (Adam momentum buffers are not saved/restored).')
     args = parser.parse_args()
 
     # Dataset-specific defaults
@@ -246,7 +250,7 @@ if __name__ == '__main__':
 
     # 3. Optimizers & Loss
     num_epochs = args.epochs
-    opt, sch = build_optimizer_and_scheduler(model, lr=1e-4, warmup_steps=500, total_steps=num_epochs * len(dataloader))
+    opt, sch = build_optimizer_and_scheduler(model, lr=args.lr, warmup_steps=500, total_steps=num_epochs * len(dataloader))
     loss_fn = DetectionLoss(lambda_box=5.0, lambda_giou=2.0, lambda_cls=2.0).to(device)
 
     os.makedirs('D:/cope-delta-det2/checkpoints', exist_ok=True)

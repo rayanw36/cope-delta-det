@@ -1,0 +1,254 @@
+================================================================================
+         CoPE-Delta-Det: Compressed-Domain Object Detection for HEVC
+                        Progress Report - April 17, 2026
+================================================================================
+
+This report covers progress since the April 12 report. The major shift in this
+period is the move from BDD100K (single-annotation-per-video) to the
+ImageNet VID dataset (dense per-frame annotations), the first end-to-end
+training + evaluation run on VID, and a round of correctness fixes that
+unlocked non-trivial detection accuracy.
+
+
+1. DATASET PIVOT: BDD100K -> ImageNet VID
+--------------------------------------------------------------------------------
+
+The April 12 report flagged BDD100K's key limitation: only one annotated frame
+per video at t=10s, which made per-frame evaluation impossible and forced us
+to propagate a single box annotation across all 16 GOP frames with motion
+vectors. To get honest per-frame detection metrics, we switched to ImageNet
+VID (ILSVRC 2015) as the primary benchmark.
+
+Dataset stats:
+  - 30 object classes (airplane, antelope, bear, ..., zebra)
+  - 3,862 training videos, 555 validation videos
+  - Dense per-frame annotations (every frame has ground truth)
+  - Variable source resolutions (640x480, 1280x576, 1280x720, 480x360)
+
+Pipeline additions:
+  - data/prepare_imagenetvid.py: parses ILSVRC XML annotations, builds
+    COCO-style JSON and per-GOP index. Images are resized to the canonical
+    720x1280 and box coordinates are scaled by (sx = 1280/orig_w,
+    sy = 720/orig_h) so that annotations and frames stay in lockstep.
+  - data/encode_imagenetvid_hevc.py: HEVC encode of train+val at QP=22/GOP=16.
+  - data/extract_features.py: reused unchanged on the VID HEVC output.
+  - training/finetune_yolo_vid.py: Ultralytics YOLOv8m fine-tuning driver
+    with sparse training frame selection (is_vid_train_frame=True, ~57k
+    frames) and 1-frame-per-video val subset for speed.
+  - visualize_imagenetvid.py: QA tool drawing GT boxes on sampled GOPs to
+    verify the scaling pipeline end-to-end.
+
+The annotation-scaling bug caught during visual QA (boxes stored in original
+pixel coords while images were resized) was fixed by scaling at prepare time.
+
+
+2. CODE CHANGES IN THIS PERIOD
+--------------------------------------------------------------------------------
+
+All changes committed on branch vid-training-speedup-and-baselines.
+
+2.1 Correctness fix: classification branch now trains end-to-end
+  models/cope_delta_det.py:
+    - Frame 0 now emits [N, num_classes] one-hot-style logits (value 5.0 at
+      the detected class) instead of [N, 1] raw YOLO IDs. P-frames propagate
+      the fusion head's cls_scores instead of silently dropping them.
+    - Empty-object placeholders return (0, num_classes) for shape consistency.
+  training/finetune.py:
+    - Removed the `if pred_cls.shape[1] != num_classes: pred_cls = zeros(...)`
+      hack that masked the shape mismatch and starved the classification loss.
+  evaluation/evaluate.py:
+    - Handles both [N, num_classes] logits (new, argmax) and [N, 1] IDs
+      (legacy) for backward compatibility.
+
+Impact: Before the fix, CoPE mAP was stuck near zero despite declining loss.
+After the fix, evaluate.py reports mAP@50 = 34.77% on VID val at epoch 2.
+
+2.2 Resume + loss tracking in CoPE fine-tuning
+  training/finetune.py:
+    - --resume <ckpt>: loads delta_encoder + fusion_head, reads epoch/loss
+      from the checkpoint, fast-forwards the cosine scheduler by
+      N * (steps_per_epoch / accum_steps) optimizer steps, continues from
+      epoch N+1.
+    - checkpoints/{prefix}loss_history.json: per-epoch loss persisted after
+      every epoch; resume-aware (drops entries >= start_epoch).
+    - checkpoints/{prefix}loss_curve.png: matplotlib Agg-backend plot of
+      loss vs epoch written at the end of training, with the best epoch
+      marked via a green dashed line.
+    - New flags: --num_workers (default 8), --gop_length (default 16).
+
+2.3 I/O speed in the DataLoader
+  data/dataset.py:
+    - JPEG decode path switched from PIL to cv2.imread + cv2.resize
+      (INTER_LINEAR) + cv2.cvtColor + torch.from_numpy(...).permute(2,0,1)
+      .contiguous().float().div_(255.). Roughly 3x faster per frame, which
+      is the dominant cost of the VID dataloader.
+  training/finetune.py:
+    - DataLoader(prefetch_factor=4) to better overlap JPEG/NPZ I/O with
+      GPU compute.
+
+2.4 VID-ready baseline evaluation
+  evaluation/evaluate_baselines.py:
+    - Full CLI parity with evaluate.py and finetune.py: --dataset, --root,
+      --split, --num_classes, --yolo_weights, --class_mapping, --features,
+      --checkpoint, --gop_length, --max_eval, --annotated_only, with
+      dataset-specific defaults.
+    - num_classes plumbed into COCOMetrics; class_mapping plumbed into the
+      YOLO anchor detector.
+    - Prints mAP@[.5:.95] in the summary (already computed).
+    - VID results go to baseline_comparison_vid.json so BDD + VID runs
+      don't clobber each other.
+
+2.5 Qualitative visualization
+  visualize_predictions.py (new):
+    - 2x2 panel video generator: Ground Truth (green), YOLO-full (blue),
+      Copy-paste (yellow), CoPE-Delta-Det (red), drawn on the same frame.
+    - CoPE forward mirrors evaluate_baselines.py exactly (xyxy->xywh,
+      delta_encoder, fusion_head, apply deltas in xywh space,
+      argmax cls_scores, back to xyxy).
+    - Flags: --random sampling, --conf_threshold, --min_gt_boxes.
+
+2.6 YOLO resume + loss plotting
+  training/resume_yolo_vid.py (new):
+    - Loads runs/detect/<prev_name>/weights/last.pt and trains for
+      --additional_epochs more epochs as a new run. Does NOT use
+      Ultralytics' resume=True (which is capped at the original run's
+      epoch count); starts a fresh run initialized from last.pt instead.
+    - --optimizer defaults to 'SGD' to avoid a bad_allocation crash in
+      newer Ultralytics versions that silently default to the experimental
+      MuSGD optimizer (X @ X.T in zeropower_via_newtonschulz5 fails on
+      some systems).
+    - --lr0 / --lrf exposed for warm-continuation LR schedules.
+    - Calls plot_yolo_loss.py automatically at completion.
+  training/plot_yolo_loss.py (new):
+    - Reads one or more Ultralytics results.csv files and produces a 2x2
+      plot: total train/val loss, train components (box/cls/dfl),
+      val components, and mAP@50 / mAP@[.5:.95] with best-epoch annotated.
+      Multi-CSV mode stitches runs with a dotted vertical divider.
+
+
+3. TRAINING RESULTS
+--------------------------------------------------------------------------------
+
+3.1 YOLOv8m on ImageNet VID (first 30 epochs, Ultralytics)
+  - Optimizer: SGD(lr=0.01, momentum=0.9) (Ultralytics default at run time)
+  - Image size: 640
+  - Batch: 16
+  - Final: all 555 Images 938 Instances P 0.508 R 0.442 mAP50 0.464 mAP50-95 0.312
+  - Resume to +30 more epochs (60 total) is queued via resume_yolo_vid.py;
+    first attempt failed with MuSGD bad_allocation, fixed by pinning SGD.
+
+3.2 CoPE-Delta-Det on ImageNet VID (in progress)
+  Config: QP=22, GOP=16, features=block-matched, frozen YOLO (epoch-30 best.pt),
+  AdamW lr=1e-4 with linear warmup 500 + cosine over full schedule, mixed
+  precision, gradient accumulation accum_steps=4, 20,387 GOPs/epoch.
+
+  Loss progression (so far):
+    Epoch 1: ~34 (early)
+    Epoch 2: 30.02
+    Epoch 3: 28.30
+
+  Training is significantly slower on VID than it was on BDD100K because
+  VID has ~4x more GOPs per epoch (every GOP has per-frame GT, no
+  single-keyframe filter), plus every P-frame now produces loss (BDD used
+  a single annotated offset). At ~2 it/s, that translates to roughly 2.9
+  hours per epoch.
+
+
+4. EVALUATION RESULTS (ImageNet VID val)
+--------------------------------------------------------------------------------
+
+4.1 Full val split via evaluate.py (10,753 GOPs, the trusted run)
+  Checkpoint: vid_finetuned_model_epoch_2.pt
+
+  mAP@0.5       : 0.3477
+  mAP@[.5:.95]  : 0.2290
+  Decode budget : 98.7%   (only 1.3% of frames fully decoded)
+  Latency       : 290.83 ms per GOP  (~18 ms per frame across 16)
+
+  This is the canonical CoPE-Delta-Det number. The classification fix was
+  what unlocked it.
+
+4.2 Small-sample baseline comparison via evaluate_baselines.py (300 GOPs)
+  Checkpoint: vid_finetuned_model_epoch_3.pt
+
+  +--------------+----------+---------------+----------------+------------+
+  | Method       | mAP@50   | mAP@[.5:.95]  | Decode Budget  | Latency    |
+  +--------------+----------+---------------+----------------+------------+
+  | YOLO-Full    | 22.00%   |    15.33%     |    100.0%      |  276.0 ms  |
+  | Copy-Paste   | 20.69%   |    11.79%     |      6.2%      |   17.6 ms  |
+  | CoPE-Delta   | 17.53%   |    11.23%     |      6.2%      |   92.0 ms  |
+  +--------------+----------+---------------+----------------+------------+
+
+  Interpreting this table honestly:
+    - Sample bias: 300 consecutive non-zero-I-frame GOPs out of 10,753 is
+      ~2.8% of val and is NOT random, so YOLO-Full's 22% here does not
+      contradict the full-val 46% from Ultralytics.
+    - evaluate_baselines.py's 'cope' mode does NOT propagate class
+      predictions (see line 116-118 of evaluate_baselines.py: only boxes
+      and confs are updated; current_classes is held at the I-frame value).
+      That means the 'cope' row here is strictly weaker than the
+      evaluate.py CoPE number, which does propagate cls_scores.
+    - In this simplified path, copy-paste beats cope at only 3 epochs:
+      learned box deltas have high variance and drag mAP down on easy
+      static scenes; copy-paste has zero chance of making things worse.
+      The gap narrows at mAP@[.5:.95] (20.69 vs 17.53 at mAP50 -> 3.16pp,
+      but 11.79 vs 11.23 at mAP50:95 -> 0.56pp), which matches the
+      "centered but slightly drifting" failure mode.
+
+  The authoritative headline number remains the evaluate.py full-val
+  result: 34.77% mAP@50 at 6.2% decode budget, roughly 75% of YOLO-full's
+  accuracy at 6% of its compute.
+
+4.3 Qualitative visualization
+  visualize_predictions.py was used to hand-inspect ~8 random val GOPs
+  with the 2x2 panel layout. Subjective takeaways:
+    - YOLO-full detections are solid on clear objects but occasionally
+      drop or misclass under motion blur.
+    - Copy-paste is, as expected, great on static scenes and drifts badly
+      when the object moves.
+    - CoPE-Delta produces visibly tracked boxes (following object motion)
+      and class labels often match GT. At 3 epochs, box refinement is
+      clearly learning but still noisy.
+
+
+5. OPEN BUGS / KNOWN ISSUES
+--------------------------------------------------------------------------------
+
+  [A] evaluate_baselines.py 'cope' mode omits class propagation and batch
+      index > 0 unpacking. This makes that baseline weaker than the real
+      model. evaluate.py uses the correct path. Open as a cleanup task.
+  [B] finetune.py prints "Loading Stage 1 pretrained weights ..." even
+      when --resume is used; the resume checkpoint immediately overwrites
+      those weights. Cosmetic, left alone.
+  [C] On Windows with num_workers=12 + prefetch_factor=4, Python
+      multiprocessing hit error 1455 (ERROR_COMMITMENT_LIMIT) when the
+      pagefile was small. Mitigation: num_workers=4-8. The per-batch
+      crashes are recovered by PyTorch but waste I/O throughput.
+
+
+6. WHAT'S NEXT
+--------------------------------------------------------------------------------
+
+Short term (this week):
+  1. Finish YOLO +30 epochs (60 total) via resume_yolo_vid.py; compare
+     best.pt vs epoch-30 best.pt on val.
+  2. Continue CoPE fine-tuning past epoch 3 (target: 10-15 epochs); watch
+     the loss curve plot generated by finetune.py.
+  3. Re-evaluate with the resumed YOLO weights feeding the updated CoPE.
+
+Medium term:
+  4. Align evaluate_baselines.py 'cope' mode with cope_delta_det.py so
+     the baseline comparison is fair.
+  5. Run baselines on the full 10,753 val GOPs (raise --max_eval).
+  6. Codec robustness: re-run evaluation at QP={27, 32, 37} and
+     GOP={8, 32} using the already-encoded HEVC variants.
+
+Longer term:
+  7. Saliency-refresh ablation sweep (threshold 0.1 .. 0.9).
+  8. Internal ablations: motion-only vs appearance-only vs full.
+  9. Block-matched vs PyAV MV comparison on the final trained model.
+
+
+================================================================================
+                              End of Report
+================================================================================

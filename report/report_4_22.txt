@@ -1,0 +1,245 @@
+================================================================================
+         CoPE-Delta-Det: Compressed-Domain Object Detection for HEVC
+                        Progress Report - April 22, 2026
+================================================================================
+
+This report summarizes the current project state after the ImageNet VID pivot,
+the PyAV comparison work, the later resume-training runs, the visualization
+updates, and the checkpoint/evaluation confusion that surfaced during review.
+
+
+1. EXECUTIVE SUMMARY
+--------------------------------------------------------------------------------
+
+The project has successfully moved off BDD100K and onto ImageNet VID as the
+primary benchmark. The core pipeline is working end-to-end:
+
+  - YOLO anchor detector fine-tuned on ImageNet VID.
+  - CoPE-Delta-Det trained on ImageNet VID GOPs with dense per-frame GT.
+  - Evaluation working on both block-matched features (`features`) and PyAV
+    H.264-proxy motion vectors (`features_pyav`).
+  - Qualitative comparison video generation working for longer sequences and
+    motion-ranked videos.
+
+The main source of confusion at the current stage is NOT the dataset or the
+feature pipeline. It is checkpoint naming and resume-training behavior:
+
+  - `vid_finetuned_best.pt` is still the best checkpoint from the original
+    `--prefix vid_` run and currently points to epoch 24.
+  - A later resumed run was launched WITHOUT `--prefix vid_`, so its improved
+    best checkpoint was saved to `finetuned_best.pt` instead.
+  - As a result, evaluation commands that still reference
+    `vid_finetuned_best.pt` are not evaluating the newest best-loss model.
+
+There is also evidence that later checkpoints can look worse in videos even
+when training loss goes down. This is plausible because the optimization target
+is training loss, not temporal smoothness or tracking stability, and the resume
+run did not restore optimizer state.
+
+
+2. WHAT HAS BEEN COMPLETED
+--------------------------------------------------------------------------------
+
+2.1 Dataset transition and pipeline
+
+The project has fully pivoted from BDD100K to ImageNet VID.
+
+Completed:
+  - ImageNet VID preparation pipeline implemented and used.
+  - HEVC encoding for ImageNet VID data.
+  - Feature extraction for block-matched motion vectors.
+  - Feature extraction for PyAV-based proxy codec motion vectors.
+  - Dataset loader supports both `features` and `features_pyav`.
+
+Impact:
+  - Evaluation now uses dense per-frame ground truth rather than propagated
+    single-frame labels.
+  - Qualitative results are much easier to trust and interpret.
+
+
+2.2 Model/evaluation correctness fixes
+
+Several important correctness issues were identified and fixed:
+
+  - Safer class-id handling in `models/cope_delta_det.py`.
+    Frame-0 anchor class IDs are filtered before one-hot/logit construction,
+    preventing invalid indexing when IDs fall outside `[0, num_classes)`.
+
+  - Safer ImageNet VID default mapping in `training/finetune.py`.
+    VID now defaults to `coco_to_vid` for generic COCO YOLO usage unless a
+    VID-finetuned YOLO with `identity` mapping is explicitly used.
+
+  - Evaluation now uses propagated class predictions on normal P-frames.
+    `evaluation/evaluate.py` previously updated only boxes/confidences and kept
+    stale class IDs from the most recent YOLO refresh. This was fixed so
+    `cls_scores` from the fusion head are used on non-refresh P-frames.
+
+  - Fine-tuning now supervises confidence/objectness and penalizes unmatched
+    predictions.
+    `training/losses.py` now includes a confidence BCE term, and
+    `training/finetune.py` passes matched and unmatched confidence predictions
+    into the loss so false positives are not ignored.
+
+These changes passed `py_compile` sanity checks.
+
+
+2.3 PyAV motion-vector evaluation status
+
+The PyAV feature pipeline has been used on ImageNet VID.
+
+Important clarification:
+  - `pyav_finetuned_best.pt` is an older 10-class checkpoint and belongs to
+    the earlier BDD100K phase.
+  - The ImageNet VID PyAV result documented in the April 19 report was a
+    zero-shot evaluation using:
+      `--features features_pyav`
+      with
+      `--checkpoint checkpoints/vid_finetuned_best.pt`
+
+In other words:
+  - ImageNet VID PyAV evaluation is real and documented.
+  - But it does NOT use `pyav_finetuned_best.pt`.
+
+
+2.4 Visualization improvements
+
+`visualize_predictions.py` was extended so it is no longer limited to isolated
+single GOP snippets.
+
+New capabilities:
+  - Render multiple consecutive GOPs from the same source video.
+  - Rank videos by motion magnitude and select the most dynamic ones.
+  - Filter by `video_name` substring to inspect a specific sequence.
+
+This directly supports the current need: showing longer, high-motion examples
+where CoPE should follow moving objects across time.
+
+
+3. CHECKPOINT STATE ON DISK
+--------------------------------------------------------------------------------
+
+Current important checkpoints:
+
+  `checkpoints/vid_finetuned_best.pt`
+    - epoch: 24
+    - loss : 19.0587
+    - This is the best checkpoint from the `vid_`-prefixed run.
+
+  `checkpoints/finetuned_best.pt`
+    - epoch: 28
+    - loss : 18.7988
+    - This is the best checkpoint from a later resumed run launched WITHOUT
+      `--prefix vid_`.
+
+This means the project currently has TWO best-checkpoint lines:
+
+  VID-prefixed line:
+    `vid_finetuned_best.pt`
+
+  unprefixed resumed line:
+    `finetuned_best.pt`
+
+This is why evaluation was reporting:
+  "Loaded finetuned CoPE tracker (epoch 24, loss 19.1)"
+even though a lower-loss checkpoint exists.
+
+The evaluation command was correct syntactically, but it was pointed at the
+older best file.
+
+
+4. WHY EPOCH 15 CAN LOOK BETTER THAN EPOCH 24 OR LATER
+--------------------------------------------------------------------------------
+
+This is plausible and does not necessarily mean the training code is broken.
+
+Reasons:
+
+  1. The model is selected by training loss, not by validation tracking
+     smoothness.
+
+  2. The current loss does not explicitly reward temporal stability, low jitter,
+     or visually smooth motion.
+
+  3. Resume training restores model weights but NOT optimizer state.
+     Adam's momentum buffers are lost on resume, so continuing with the same
+     learning rate can cause unstable updates near convergence.
+
+  4. The later resume run shows a real instability spike:
+       epoch 28: 18.7988
+       epoch 29: 23.8304
+       epoch 30: 26.6462
+       epoch 31: 24.8097
+     That is not smooth monotonic convergence.
+
+Interpretation:
+  - epoch 15 may have learned smoother or more conservative motion updates.
+  - epoch 24 may have slightly lower average training loss but visually noisier
+    box updates on difficult moving clips.
+  - epoch 28 may still be worth evaluating quantitatively, but it should not be
+    assumed to be visually superior just because its scalar loss is lower.
+
+
+5. TRUSTED RESULTS VS OPEN QUESTIONS
+--------------------------------------------------------------------------------
+
+Trusted:
+  - ImageNet VID is the correct benchmark.
+  - `features` and `features_pyav` both load correctly through the same dataset
+    interface.
+  - The block-match vs PyAV comparison on ImageNet VID is documented in the
+    April 19 report.
+  - The extended visualizer can now generate longer, motion-heavy clips.
+
+Open:
+  - Which checkpoint is best by validation metrics on ImageNet VID:
+    epoch 15, epoch 24, or epoch 28?
+  - Whether epoch 28's lower training loss actually improves mAP or only
+    overfits / destabilizes temporal behavior.
+  - Whether the confidence/objectness-loss update changes the ranking once a
+    clean re-train or controlled resume is run.
+
+
+6. RECOMMENDED NEXT STEP
+--------------------------------------------------------------------------------
+
+The next step should be a controlled checkpoint comparison, not more training.
+
+Recommended order:
+
+  Step 1. Quantitatively compare these three checkpoints on the SAME subset:
+    - `vid_finetuned_model_epoch_15.pt`
+    - `vid_finetuned_model_epoch_24.pt`
+    - `finetuned_model_epoch_28.pt`
+
+  Step 2. Qualitatively compare those same checkpoints on the SAME high-motion
+  long video clip using the updated visualizer.
+
+  Step 3. Only after that, decide whether to:
+    - keep epoch 15 for smoother tracking,
+    - keep epoch 24 as the stable `vid_` best,
+    - or adopt epoch 28 as the new best quantitative checkpoint.
+
+Why this is the right next step:
+  - It resolves the real confusion immediately.
+  - It avoids wasting more GPU time before establishing which checkpoint is
+    actually best on validation behavior.
+  - It gives one clean decision point before any further ablations or retrains.
+
+
+7. PRACTICAL NOTE FOR FUTURE RUNS
+--------------------------------------------------------------------------------
+
+When resuming ImageNet VID training, always do BOTH:
+
+  - keep `--prefix vid_`
+  - reduce LR on resume, e.g. `--lr 5e-5`
+
+This will:
+  - keep checkpoint naming consistent
+  - avoid silently splitting histories across `vid_*` and non-`vid_*`
+  - reduce the chance of optimizer-reset instability on resumed runs
+
+
+================================================================================
+                              End of Report
+================================================================================

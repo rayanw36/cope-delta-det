@@ -6,13 +6,14 @@ from torchvision.ops import generalized_box_iou
 class DetectionLoss(nn.Module):
     """
     Combined loss function for CoPE-Δ-Det fine-tuning.
-    L_total = λ1 * L_box(L1) + λ2 * L_GIoU + λ3 * L_cls(Focal)
+    L_total = λ1 * L_box(L1) + λ2 * L_GIoU + λ3 * L_cls(Focal) + λ4 * L_conf(BCE)
     """
-    def __init__(self, lambda_box=5.0, lambda_giou=2.0, lambda_cls=2.0):
+    def __init__(self, lambda_box=5.0, lambda_giou=2.0, lambda_cls=2.0, lambda_conf=1.0):
         super().__init__()
         self.lambda_box = lambda_box
         self.lambda_giou = lambda_giou
         self.lambda_cls = lambda_cls
+        self.lambda_conf = lambda_conf
 
     def focal_loss(self, inputs, targets, alpha=0.25, gamma=2.0):
         """
@@ -27,6 +28,7 @@ class DetectionLoss(nn.Module):
         return f_loss.mean()
 
     def forward(self, pred_boxes, pred_cls, target_boxes, target_cls,
+                pred_conf_matched=None, pred_conf_unmatched=None,
                 img_h=720, img_w=1280):
         """
         Assumes predictions and targets are matched (e.g. 1-to-1 matching done prior)
@@ -36,28 +38,51 @@ class DetectionLoss(nn.Module):
         target_cls: [N] target class indices
         img_h, img_w: image dimensions for normalizing L1 loss
         """
-        if pred_boxes.shape[0] == 0:
-            return sum([x.sum() * 0 for x in self.parameters()]) if hasattr(self, 'parameters') else torch.tensor(0.0, device=pred_boxes.device)
+        zero_terms = []
+        for tensor in (pred_boxes, pred_cls, pred_conf_matched, pred_conf_unmatched):
+            if tensor is not None:
+                zero_terms.append(tensor.sum() * 0)
+        zero = sum(zero_terms) if zero_terms else torch.tensor(0.0, device=target_boxes.device if target_boxes.numel() > 0 else 'cpu')
 
-        # 1. L1 Box Loss — normalize to [0, 1] so loss scale is independent of resolution
-        norm = torch.tensor([img_w, img_h, img_w, img_h],
-                           device=pred_boxes.device, dtype=pred_boxes.dtype)
-        loss_l1 = F.l1_loss(pred_boxes / norm, target_boxes / norm, reduction='mean')
+        if pred_boxes.shape[0] > 0:
+            # 1. L1 Box Loss — normalize to [0, 1] so loss scale is independent of resolution
+            norm = torch.tensor([img_w, img_h, img_w, img_h],
+                               device=pred_boxes.device, dtype=pred_boxes.dtype)
+            loss_l1 = F.l1_loss(pred_boxes / norm, target_boxes / norm, reduction='mean')
 
-        # 2. GIoU Loss (scale-invariant, no normalization needed)
-        giou_matrix = generalized_box_iou(pred_boxes, target_boxes)
-        giou = torch.diag(giou_matrix)
-        loss_giou = 1 - giou.mean()
+            # 2. GIoU Loss (scale-invariant, no normalization needed)
+            giou_matrix = generalized_box_iou(pred_boxes, target_boxes)
+            giou = torch.diag(giou_matrix)
+            loss_giou = 1 - giou.mean()
 
-        # 3. Focal Classification Loss
-        loss_cls = self.focal_loss(pred_cls, target_cls)
+            # 3. Focal Classification Loss
+            loss_cls = self.focal_loss(pred_cls, target_cls)
+        else:
+            loss_l1 = zero
+            loss_giou = zero
+            loss_cls = zero
 
-        total_loss = self.lambda_box * loss_l1 + self.lambda_giou * loss_giou + self.lambda_cls * loss_cls
+        conf_losses = []
+        if pred_conf_matched is not None and pred_conf_matched.numel() > 0:
+            pos_targets = torch.ones_like(pred_conf_matched)
+            conf_losses.append(F.binary_cross_entropy(pred_conf_matched.clamp(1e-6, 1 - 1e-6), pos_targets))
+        if pred_conf_unmatched is not None and pred_conf_unmatched.numel() > 0:
+            neg_targets = torch.zeros_like(pred_conf_unmatched)
+            conf_losses.append(F.binary_cross_entropy(pred_conf_unmatched.clamp(1e-6, 1 - 1e-6), neg_targets))
+        loss_conf = torch.stack(conf_losses).mean() if conf_losses else zero
+
+        total_loss = (
+            self.lambda_box * loss_l1 +
+            self.lambda_giou * loss_giou +
+            self.lambda_cls * loss_cls +
+            self.lambda_conf * loss_conf
+        )
 
         return total_loss, {
             'l1': loss_l1.item(),
             'giou': loss_giou.item(),
             'cls': loss_cls.item(),
+            'conf': loss_conf.item(),
             'total': total_loss.item()
         }
 

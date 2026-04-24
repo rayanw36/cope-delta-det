@@ -58,9 +58,13 @@ def wait_for_training(epoch: int = 30, poll_secs: int = 300):
     print(f'  [{datetime.now():%H:%M:%S}] Found! Training complete.')
 
 
-def load_json(path: Path) -> dict | list | None:
+def load_json(path: Path) -> dict | None:
+    """Load a result JSON; unwrap single-element lists from evaluate_baselines.py."""
     try:
-        return json.loads(path.read_text())
+        data = json.loads(path.read_text())
+        if isinstance(data, list):
+            return data[0] if len(data) == 1 else data[0]  # baselines always saves [{}]
+        return data
     except Exception:
         return None
 
@@ -102,7 +106,9 @@ def main():
                      '--yolo_weights', args.yolo,
                      '--num_classes', '30']
     cope_flags = ['--checkpoint', ckpt, '--policy_thresh', '999']
-    max_full = ['--max_eval', str(args.max_full)] if args.max_full else []
+    # Baselines use max_eval too; None means all GOPs (no --max_eval flag passed = new default)
+    max_full_baseline = ['--max_eval', str(args.max_full)] if args.max_full else []
+    max_full_cope = ['--max_eval', str(args.max_full)] if args.max_full else []
     max_ablation = ['--max_eval', str(args.max_ablation)]
 
     print('\n' + '='*60)
@@ -122,7 +128,7 @@ def main():
               '--mode', 'yolo_full',
               *dataset_flags,
               '--output', str(out_yolo),
-              *max_full], args.dry_run)
+              *max_full_baseline], args.dry_run)
     if rc: errors.append(f'yolo_full (rc={rc})')
 
     # ----------------------------------------------------------------
@@ -134,7 +140,7 @@ def main():
               *dataset_flags,
               '--checkpoint', ckpt,
               '--output', str(out_cp),
-              *max_full], args.dry_run)
+              *max_full_baseline], args.dry_run)
     if rc: errors.append(f'copy_paste (rc={rc})')
 
     # ----------------------------------------------------------------
@@ -146,7 +152,7 @@ def main():
               *dataset_flags,
               *cope_flags,
               '--output', str(out_cope_block),
-              *max_full], args.dry_run)
+              *max_full_cope], args.dry_run)
     if rc: errors.append(f'cope_block (rc={rc})')
 
     # ----------------------------------------------------------------
@@ -158,7 +164,7 @@ def main():
               *dataset_flags,
               *cope_flags,
               '--output', str(out_cope_pyav),
-              *max_full], args.dry_run)
+              *max_full_cope], args.dry_run)
     if rc: errors.append(f'cope_pyav (rc={rc})')
 
     # ----------------------------------------------------------------

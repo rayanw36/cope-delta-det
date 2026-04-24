@@ -128,12 +128,13 @@ def evaluate_cope_delta_det(model, dataset, device, measure_latency=True, policy
                         flat_anchors = torch.cat([boxes_xywh, flat_confs], dim=1)
 
                         delta_tokens = model.delta_encoder(mvs_t, app_t, flat_boxes, b_ids)
-                        box_deltas, conf_updates, _ = model.fusion_head(flat_anchors, delta_tokens)
+                        box_deltas, conf_updates, cls_scores = model.fusion_head(flat_anchors, delta_tokens)
 
                         # Apply deltas in xywh space, convert back to xyxy
                         updated_xywh = boxes_xywh + box_deltas
                         current_boxes = [xywh_to_xyxy(updated_xywh)]
                         current_confs = [flat_confs * conf_updates]
+                        current_classes = [cls_scores]
                         
                 predictions.append({'boxes': current_boxes, 'confs': current_confs, 'classes': current_classes})
                 

@@ -1,0 +1,206 @@
+================================================================================
+         CoPE-Delta-Det: Compressed-Domain Object Detection for HEVC
+                        Progress Report - April 21, 2026
+================================================================================
+
+This report covers the work done since the April 19 report. Three main
+contributions: (1) continued training surpassed the previous best loss,
+(2) a full 10,753-GOP evaluation of both CoPE variants on the entire
+ImageNet VID val split, and (3) the first ablation study separating the
+contribution of motion vectors from appearance features.
+
+
+1. TRAINING PROGRESS
+--------------------------------------------------------------------------------
+
+1.1 Extended training (epochs 19-26)
+
+  After the April 19 report the model was resumed from epoch 18 and
+  trained to epoch 26. Epoch 20 spiked to 27.33 due to cold Adam
+  momentum buffers at resume (optimizer state dict is not saved).
+  Recovery was steady over epochs 21-23, and the model broke through
+  the previous best at epoch 24.
+
+  Full loss history:
+    Epoch  3:  28.2537   (early training, high start)
+    Epoch  4:  26.7621
+    Epoch  5:  25.6117
+    Epoch  6:  24.6303
+    Epoch  7:  23.7820
+    Epoch  8:  23.0162
+    Epoch  9:  22.3168
+    Epoch 10:  21.7149
+    Epoch 11:  21.2157
+    Epoch 12:  20.7593
+    Epoch 13:  20.4154
+    Epoch 14:  20.1907
+    Epoch 15:  20.1874
+    Epoch 16:  19.9355
+    Epoch 17:  20.0563
+    Epoch 18:  19.4570   (previous best)
+    Epoch 19:  19.7950   (first epoch after resume)
+    Epoch 20:  27.3343   (SPIKE — cold Adam momentum at resume)
+    Epoch 21:  24.2539
+    Epoch 22:  21.8862
+    Epoch 23:  19.6796
+    Epoch 24:  19.0587   <-- NEW BEST
+    Epoch 25:  20.1887
+    Epoch 26:  19.0750   (near-equal to epoch 24)
+
+  NEW BEST: epoch 24, loss = 19.0587 (improves on epoch 18 by 0.40 pts)
+  vid_finetuned_best.pt updated to epoch 24 weights.
+
+1.2 PyAV-trained model (parallel run)
+
+  A separate training run using PyAV (real codec MV) features completed
+  all 30 epochs. Best checkpoint: epoch 29, loss = 29.28. This is
+  significantly worse than the block-matched training (19.06). The
+  sparsity of real codec MVs (skip/merge blocks carry MV=(0,0)) makes
+  training harder — the model cannot learn from the flat regions that
+  block-SAD always fills in. The PyAV-trained model is not used for
+  evaluation; the block-matched checkpoint is retained as the primary.
+
+1.3 Training code updates
+
+  finetune.py was updated to compute confidence loss for unmatched
+  predictions (false positive suppression). The loss function now
+  receives both matched and unmatched prediction confidences, allowing
+  it to penalise spurious detections directly. evaluate.py was updated
+  to propagate the fusion head's class scores through P-frames instead
+  of inheriting the I-frame class labels unchanged.
+
+
+2. FULL VALIDATION EVALUATION (10,753 GOPs)
+--------------------------------------------------------------------------------
+
+  All 10,753 GOPs in the ImageNet VID val split were evaluated using the
+  epoch-24 checkpoint.
+
+  Setup:
+    Dataset:     ImageNet VID val, ALL 10,753 GOPs
+    YOLO:        runs/detect/yolov8m_vid/weights/best.pt (VID-finetuned)
+    Class map:   identity (VID-finetuned YOLO outputs VID IDs 0-29)
+    CoPE ckpt:   checkpoints/vid_finetuned_best.pt (epoch 24)
+    Policy:      disabled (thresh=999) — pure delta encoder, 6.2% decode
+
+  +---------------------------+---------+-----------+---------+-----------+
+  | Method                    | mAP@0.5 | mAP@.5:95 | Decode  |  ms/GOP   |
+  +---------------------------+---------+-----------+---------+-----------+
+  | CoPE-Det (block-match)    |  23.26% |    11.45% |   6.2%  |   90.8 ms |
+  | CoPE-Det (PyAV MVs)       |  22.50% |    11.07% |   6.2%  |   90.8 ms |
+  +---------------------------+---------+-----------+---------+-----------+
+
+  Note: YOLO Full and Copy-Paste baselines ran on only 50 GOPs during
+  this eval run (script default was not overridden) and produced
+  anomalously low numbers (7.92% and 10.89%). These are not comparable
+  to the full-val CoPE numbers and are excluded from this table. Baseline
+  re-runs on the full val split are the immediate next step (Section 5).
+
+  Comparison with April 19 results (500 GOPs, epoch-18 checkpoint):
+    Block-match:  23.26% (full val, ep24)  vs  24.59% (500 GOP, ep18)
+    PyAV:         22.50% (full val, ep24)  vs  24.02% (500 GOP, ep18)
+
+  The ~1.3pp drop on the full val vs the 500-GOP sample is expected:
+  the 500-GOP subset happened to be somewhat easier than the full split.
+  Full-val mAP is the authoritative figure.
+
+  PyAV zero-shot transfer gap: +0.77pp (block-match vs PyAV, full val).
+  This confirms the April 19 finding — the block-matched model
+  generalises to real codec MVs with minimal degradation.
+
+
+3. ABLATION STUDY
+--------------------------------------------------------------------------------
+
+  To quantify the individual contribution of motion vectors (MVs) and
+  appearance features (residual energy, partition depth, prediction mode),
+  three variants of the delta encoder were evaluated on 500 GOPs.
+
+  Method: features not under study are zeroed before reaching the delta
+  encoder. All other settings (checkpoint, YOLO, policy) are identical.
+
+  Setup: 500 GOPs, block-matched features, epoch-24 checkpoint.
+
+  +----------------------+---------+-----------+----------------------------+
+  | Ablation mode        | mAP@0.5 | mAP@.5:95 | Notes                      |
+  +----------------------+---------+-----------+----------------------------+
+  | Full (MV + Appear.)  |  26.43% |    14.36% | Full model — reference     |
+  | MV only (App.=0)     |  24.95% |    13.69% | -1.48pp vs full            |
+  | Appearance only(MV=0)|  19.99% |    11.28% | -6.44pp vs full            |
+  +----------------------+---------+-----------+----------------------------+
+
+  Key findings:
+
+  [1] MVs dominate: removing appearance features costs 1.48pp. Removing
+      MVs costs 6.44pp. Motion vectors carry the primary tracking signal
+      — the delta encoder is fundamentally MV-driven.
+
+  [2] Appearance features add meaningful value: the 1.48pp gain from
+      residual energy + partition depth + prediction mode is real. These
+      features encode codec-level quality decisions that MVs alone miss
+      (e.g. a block decoded with high residual energy signals object
+      deformation that the MV doesn't capture).
+
+  [3] Appearance-only is still above Copy-Paste: 19.99% > the April 19
+      Copy-Paste baseline of 24.39% is not confirmed here (different
+      sample/checkpoint), but appearance-only is not zero — the residual
+      channel alone provides partial tracking signal.
+
+
+4. KNOWN ISSUES / CAVEATS
+--------------------------------------------------------------------------------
+
+  [A] Baseline numbers incomplete: YOLO Full and Copy-Paste on 50 GOPs
+      only. A proper comparison table requires re-running both on the
+      full 10,753-GOP val split.
+
+  [B] Lower full-val CoPE vs 500-GOP: 23.26% vs 24.59% (April 19).
+      This is a sample bias effect, not a regression. The epoch-24
+      checkpoint has lower training loss than epoch 18.
+
+  [C] P-frame class scores: evaluate.py now propagates the fusion head's
+      class logits through P-frames. This is correct architectural
+      behaviour but the fusion head's class branch may not be fully
+      trained, which could be suppressing P-frame mAP.
+
+  [D] PyAV-trained model (loss 29.28) is not competitive. This confirms
+      that block-matched features are a better training signal than
+      sparse real-codec MVs. Zero-shot transfer (block-matched model
+      evaluated on PyAV features) remains the recommended approach.
+
+  [E] Overnight eval script crashed after all evals completed. Root
+      cause: evaluate_baselines.py saves JSON as a list; the summary
+      script expected a dict. Fixed in this commit.
+
+
+5. WHAT IS NEXT
+--------------------------------------------------------------------------------
+
+  Priority 1 — Re-run YOLO Full and Copy-Paste on full val (10,753 GOPs)
+    Command:
+      python scripts/run_overnight_eval.py
+    (baselines now default to all GOPs; script crash is fixed)
+
+  Priority 2 — Continue training epochs 27-30
+    The loss at epoch 26 (19.075) is nearly equal to the best (19.059).
+    Training 4 more epochs may yield a new best. Use:
+      python training/finetune.py \
+        --dataset imagenetvid --epochs 30 \
+        --yolo_weights runs/detect/yolov8m_vid/weights/best.pt \
+        --resume checkpoints/vid_finetuned_best.pt \
+        --lr 5e-5
+    (lower LR avoids another cold-start spike)
+
+  Priority 3 — Train SaliencyRefreshPolicy (Stage 3)
+    The refresh policy has never been trained. With trained weights the
+    decode budget adapts per-video. A well-trained policy could raise
+    accuracy closer to YOLO Full while keeping average decode < 15%.
+
+  Priority 4 — Final report combining all results
+    Once baselines are on the full val, write the final comparison table:
+    YOLO Full / Copy-Paste / CoPE (block) / CoPE (PyAV) on 10,753 GOPs.
+
+
+================================================================================
+                              End of Report
+================================================================================

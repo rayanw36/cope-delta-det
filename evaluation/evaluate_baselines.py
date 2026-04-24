@@ -21,13 +21,14 @@ from models.cope_delta_det import CoPEDeltaDet
 from utils.metrics import COCOMetrics, LatencyTracker, DecodeBudgetTracker
 from utils.box_utils import xyxy_to_xywh, xywh_to_xyxy
 
-def evaluate_baseline(model, dataset, device, mode='cope', num_classes=10, max_eval=50):
+def evaluate_baseline(model, dataset, device, mode='cope', num_classes=10, max_eval=None):
     """
     Evaluates Video Obj Detection on specific baseline architectures:
     * 'yolo_full' : Runs heavy YOLO object detection on every single frame.
     * 'copy_paste': Runs YOLO on I-frame, and just locks boxes into place on P-frames
                     (zero tracking math, lowest possible cost but terrible accuracy).
     * 'cope'      : Runs our custom CoPE-Delta-Det2 framework.
+    max_eval: cap on GOPs evaluated (None = all).
     """
     model.eval()
     metrics = COCOMetrics(num_classes=num_classes)
@@ -36,10 +37,10 @@ def evaluate_baseline(model, dataset, device, mode='cope', num_classes=10, max_e
 
     with torch.no_grad():
         evaluated_count = 0
-        
-        pbar = tqdm(total=max_eval, desc=f"Evaluating mode: {mode}")
+        n_total = len(dataset) if max_eval is None else min(max_eval, len(dataset))
+        pbar = tqdm(total=n_total, desc=f"Evaluating mode: {mode}")
         for idx in range(len(dataset)):
-            if evaluated_count >= max_eval:
+            if max_eval is not None and evaluated_count >= max_eval:
                 break
                 
             sample = dataset[idx]
@@ -180,8 +181,8 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to finetuned CoPE checkpoint (delta_encoder+fusion_head)')
     parser.add_argument('--gop_length', type=int, default=16)
-    parser.add_argument('--max_eval', type=int, default=50,
-                        help='Max GOPs to evaluate per mode (default 50)')
+    parser.add_argument('--max_eval', type=int, default=None,
+                        help='Max GOPs to evaluate per mode (default: all)')
     parser.add_argument('--annotated_only', action='store_true',
                         help='Filter to annotated GOPs only (BDD legacy)')
     parser.add_argument('--output', type=str, default=None,

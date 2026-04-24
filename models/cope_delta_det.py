@@ -60,13 +60,23 @@ class CoPEDeltaDet(nn.Module):
         for b_idx in range(batch_size):
             res = anchor_results[b_idx] # [N, 6]
             if res.shape[0] > 0:
+                cls_ids = res[:, 5].long()
+                valid_cls = (cls_ids >= 0) & (cls_ids < self.num_classes)
+
+                if valid_cls.any():
+                    res = res[valid_cls]
+                    cls_ids = cls_ids[valid_cls]
+                else:
+                    res = res[:0]
+                    cls_ids = cls_ids[:0]
+
                 frame_0_boxes.append(res[:, :4])
                 frame_0_confs.append(res[:, 4:5])
                 # Convert YOLO class ID [N, 1] to one-hot logits [N, num_classes]
                 # so frame 0 classes have the same format as P-frame cls_scores
-                cls_ids = res[:, 5].long()
                 cls_onehot = torch.zeros(res.shape[0], self.num_classes, device=device)
-                cls_onehot.scatter_(1, cls_ids.unsqueeze(1), 5.0)  # high logit for detected class
+                if cls_ids.numel() > 0:
+                    cls_onehot.scatter_(1, cls_ids.unsqueeze(1), 5.0)  # high logit for detected class
                 frame_0_classes.append(cls_onehot)
             else:
                 frame_0_boxes.append(torch.empty((0, 4), device=device))

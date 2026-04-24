@@ -54,6 +54,28 @@ def match_predictions_to_targets(pred_boxes, tgt_boxes):
             
     return torch.tensor(matched_rows, dtype=torch.long), torch.tensor(matched_cols, dtype=torch.long)
 
+
+COCO_TO_BDD = {0: 0, 1: 7, 2: 2, 3: 6, 5: 4, 6: 5, 7: 3, 9: 8, 11: 9}
+COCO_TO_VID = {
+    4: 0,   # airplane
+    21: 2,  # bear
+    1: 3,   # bicycle
+    14: 4,  # bird
+    5: 5,   # bus
+    2: 6,   # car
+    7: 6,   # truck -> car
+    19: 7,  # cow -> cattle
+    16: 8,  # dog
+    15: 9,  # cat -> domestic cat
+    20: 10, # elephant
+    17: 14, # horse
+    3: 18,  # motorcycle
+    18: 21, # sheep
+    6: 25,  # train
+    8: 27,  # boat -> watercraft
+    22: 29, # zebra
+}
+
 def train_finetune_epoch(dataloader, model, optimizer, scheduler, loss_fn, device='cuda',
                          scaler=None, accum_steps=4, num_classes=10):
     """Train one epoch with mixed precision and gradient accumulation."""
@@ -124,19 +146,26 @@ def train_finetune_epoch(dataloader, model, optimizer, scheduler, loss_fn, devic
 
                 pred_idx, tgt_idx = match_predictions_to_targets(pred_boxes, tgt_boxes)
 
-                if len(pred_idx) > 0:
-                    matched_pred_boxes = pred_boxes[pred_idx]
-                    matched_pred_cls = pred_cls[pred_idx]
-                    matched_tgt_boxes = tgt_boxes[tgt_idx]
-                    matched_tgt_cls = tgt_cls[tgt_idx].long()
+                matched_pred_boxes = pred_boxes[pred_idx]
+                matched_pred_cls = pred_cls[pred_idx]
+                matched_tgt_boxes = tgt_boxes[tgt_idx]
+                matched_tgt_cls = tgt_cls[tgt_idx].long()
+                matched_pred_conf = pred_conf[pred_idx] if pred_conf.shape[0] > 0 else pred_conf
 
-                    loss, _ = loss_fn(
-                        matched_pred_boxes,
-                        matched_pred_cls,
-                        matched_tgt_boxes,
-                        matched_tgt_cls
-                    )
-                    batch_loss += loss
+                unmatched_mask = torch.ones(pred_boxes.shape[0], dtype=torch.bool, device=device)
+                if len(pred_idx) > 0:
+                    unmatched_mask[pred_idx] = False
+                unmatched_pred_conf = pred_conf[unmatched_mask] if pred_conf.shape[0] > 0 else pred_conf
+
+                loss, _ = loss_fn(
+                    matched_pred_boxes,
+                    matched_pred_cls,
+                    matched_tgt_boxes,
+                    matched_tgt_cls,
+                    pred_conf_matched=matched_pred_conf,
+                    pred_conf_unmatched=unmatched_pred_conf
+                )
+                batch_loss += loss
 
         if isinstance(batch_loss, torch.Tensor) and batch_loss.requires_grad:
             scaled_loss = batch_loss / accum_steps
@@ -205,7 +234,7 @@ if __name__ == '__main__':
     if args.num_classes is None:
         args.num_classes = 10 if args.dataset == 'bdd100k' else 30
     if args.class_mapping is None:
-        args.class_mapping = 'coco_to_bdd' if args.dataset == 'bdd100k' else 'identity'
+        args.class_mapping = 'coco_to_bdd' if args.dataset == 'bdd100k' else 'coco_to_vid'
     # For VID we want all GOPs (every frame has real GT); for BDD legacy, annotated_only.
     annotated_only_flag = args.annotated_only or (args.dataset == 'bdd100k')
 
@@ -236,7 +265,9 @@ if __name__ == '__main__':
             if args.class_mapping in (None, 'identity'):
                 model.anchor_detector.class_mapping = None
             elif args.class_mapping == 'coco_to_bdd':
-                model.anchor_detector.class_mapping = {0: 0, 1: 7, 2: 2, 3: 6, 5: 4, 6: 5, 7: 3, 9: 8, 11: 9}
+                model.anchor_detector.class_mapping = COCO_TO_BDD
+            elif args.class_mapping == 'coco_to_vid':
+                model.anchor_detector.class_mapping = COCO_TO_VID
     except Exception as e:
         print(f"  (note) could not set class_mapping on anchor: {e}")
 
@@ -251,7 +282,7 @@ if __name__ == '__main__':
     # 3. Optimizers & Loss
     num_epochs = args.epochs
     opt, sch = build_optimizer_and_scheduler(model, lr=args.lr, warmup_steps=500, total_steps=num_epochs * len(dataloader))
-    loss_fn = DetectionLoss(lambda_box=5.0, lambda_giou=2.0, lambda_cls=2.0).to(device)
+    loss_fn = DetectionLoss(lambda_box=5.0, lambda_giou=2.0, lambda_cls=2.0, lambda_conf=1.0).to(device)
 
     os.makedirs('D:/cope-delta-det2/checkpoints', exist_ok=True)
 

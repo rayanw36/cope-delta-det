@@ -27,6 +27,7 @@ Usage:
 import argparse
 import random
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import cv2
@@ -156,6 +157,77 @@ def run_cope_pframe(model, current_boxes_xyxy: torch.Tensor,
     return updated_xyxy, updated_confs, cls_scores
 
 
+def build_video_groups(dataset):
+    """Group GOP indices by source video and keep them in temporal order."""
+    groups = defaultdict(list)
+    for idx, gop in enumerate(dataset.gops):
+        groups[gop['video_name']].append(idx)
+    for video_name in groups:
+        groups[video_name].sort(key=lambda i: dataset.gops[i]['start_frame'])
+    return groups
+
+
+def estimate_video_motion(dataset, gop_indices, max_gops_to_scan=4):
+    """Estimate how dynamic a video is using mean MV magnitude over a few GOPs."""
+    scores = []
+    for idx in gop_indices[:max_gops_to_scan]:
+        gop_meta = dataset.gops[idx]
+        mvs_t, _, _, _, _ = dataset.load_frame_features(
+            gop_meta['video_name'],
+            gop_meta['start_frame'],
+            gop_meta.get('num_frames', dataset.gop_length),
+        )
+        if mvs_t.numel() == 0:
+            continue
+        mv_mag = torch.linalg.vector_norm(mvs_t.float(), dim=-1).mean().item()
+        scores.append(mv_mag)
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def select_gop_indices(dataset, args):
+    """Return GOP indices and a short description of the selection policy."""
+    video_groups = build_video_groups(dataset)
+    all_video_names = sorted(video_groups.keys())
+
+    if args.video_name:
+        matched_names = [v for v in all_video_names if args.video_name.lower() in v.lower()]
+        if not matched_names:
+            raise ValueError(f"No video_name matched '{args.video_name}'")
+        selected_videos = matched_names[:args.num_videos]
+        description = f"video filter '{args.video_name}'"
+    elif args.sort_videos_by_motion:
+        scored_videos = []
+        for video_name in all_video_names:
+            score = estimate_video_motion(dataset, video_groups[video_name], max_gops_to_scan=args.motion_scan_gops)
+            if score >= args.min_motion_score:
+                scored_videos.append((score, video_name))
+        scored_videos.sort(reverse=True)
+        selected_videos = [video_name for _, video_name in scored_videos[:args.num_videos]]
+        description = f"top-{args.num_videos} motion-ranked videos"
+    else:
+        selected_videos = all_video_names[:]
+        if args.random:
+            random.shuffle(selected_videos)
+        selected_videos = selected_videos[:args.num_videos]
+        description = "random videos" if args.random else "first videos"
+
+    if args.sort_videos_by_motion:
+        print("\nSelected videos by motion:")
+        for rank, video_name in enumerate(selected_videos, start=1):
+            score = estimate_video_motion(dataset, video_groups[video_name], max_gops_to_scan=args.motion_scan_gops)
+            print(f"  {rank:2d}. {video_name}  motion_score={score:.3f}")
+
+    selected_indices = []
+    for video_name in selected_videos:
+        indices = video_groups[video_name]
+        if args.random and not args.video_name and not args.sort_videos_by_motion:
+            start_offset = random.randint(0, max(0, len(indices) - args.gops_per_video))
+            indices = indices[start_offset:]
+        selected_indices.extend(indices[:args.gops_per_video])
+
+    return selected_indices, description
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dataset', type=str, default='imagenetvid',
@@ -172,6 +244,18 @@ def main():
     ap.add_argument('--num_gops', type=int, default=8)
     ap.add_argument('--random', action='store_true', help='Random GOPs rather than first N')
     ap.add_argument('--seed', type=int, default=42)
+    ap.add_argument('--num_videos', type=int, default=1,
+                    help='Number of source videos to visualize when using consecutive GOP mode')
+    ap.add_argument('--gops_per_video', type=int, default=4,
+                    help='How many consecutive GOPs to render per selected video')
+    ap.add_argument('--video_name', type=str, default=None,
+                    help='Substring match for a specific video_name to visualize')
+    ap.add_argument('--sort_videos_by_motion', action='store_true',
+                    help='Rank videos by estimated MV magnitude and pick the most dynamic ones')
+    ap.add_argument('--motion_scan_gops', type=int, default=4,
+                    help='How many GOPs per video to scan when estimating motion')
+    ap.add_argument('--min_motion_score', type=float, default=0.0,
+                    help='Minimum motion score when using --sort_videos_by_motion')
     ap.add_argument('--min_gt_boxes', type=int, default=1,
                     help='Skip GOPs whose I-frame has fewer than this many GT boxes')
     ap.add_argument('--output', type=str, default=None)
@@ -216,6 +300,12 @@ def main():
         elif args.class_mapping == 'coco_to_bdd':
             model.anchor_detector.class_mapping = {
                 0: 0, 1: 7, 2: 2, 3: 6, 5: 4, 6: 5, 7: 3, 9: 8, 11: 9}
+        elif args.class_mapping == 'coco_to_vid':
+            model.anchor_detector.class_mapping = {
+                4: 0, 21: 2, 1: 3, 14: 4, 5: 5, 2: 6, 7: 6, 19: 7,
+                16: 8, 15: 9, 20: 10, 17: 14, 3: 18, 18: 21, 6: 25,
+                8: 27, 22: 29,
+            }
 
     if Path(args.checkpoint).exists():
         ckpt = torch.load(args.checkpoint, map_location=device)
@@ -232,9 +322,16 @@ def main():
 
     # Pick GOP indices
     random.seed(args.seed)
-    indices = list(range(len(dataset)))
-    if args.random:
-        random.shuffle(indices)
+    if args.video_name or args.sort_videos_by_motion or args.gops_per_video != 1 or args.num_videos != 1:
+        indices, selection_desc = select_gop_indices(dataset, args)
+        print(f"Selection mode: {selection_desc}")
+    else:
+        indices = list(range(len(dataset)))
+        if args.random:
+            random.shuffle(indices)
+        indices = indices[:args.num_gops]
+        selection_desc = "random GOPs" if args.random else "first GOPs"
+        print(f"Selection mode: {selection_desc}")
 
     # Video writer (2x2 tiles of 640x360, plus header bars => 640x (360+28) per tile,
     # full canvas = 2*640 x 2*388 = 1280 x 776)
@@ -247,12 +344,11 @@ def main():
 
     gops_used = 0
     total_frames = 0
-    pbar = tqdm(total=args.num_gops, desc=f"Visualising ({args.dataset}/{args.split})")
+    target_gops = len(indices) if indices else args.num_gops
+    pbar = tqdm(total=target_gops, desc=f"Visualising ({args.dataset}/{args.split})")
 
     with torch.no_grad():
         for idx in indices:
-            if gops_used >= args.num_gops:
-                break
             try:
                 sample = dataset[idx]
             except Exception as e:
@@ -349,7 +445,7 @@ def main():
 
             # --- Emit I-frame tile ---
             iframe_bgr = tensor_frame_to_bgr(sample['iframe_rgb'])
-            header = f"GOP {gops_used+1}/{args.num_gops}  {video_name}  frame 0/{num_pframes} (I)"
+            header = f"GOP {gops_used+1}/{target_gops}  {video_name}  frame 0/{num_pframes} (I)"
             tile = build_frame_tiles(
                 iframe_bgr, targets[0],
                 yolo_boxes_t, yolo_conf_t, yolo_cls_t,
@@ -384,7 +480,7 @@ def main():
                 gt_target = targets[gt_idx] if gt_idx < len(targets) else {
                     'boxes': torch.empty((0, 4)), 'labels': torch.empty((0,), dtype=torch.long)}
 
-                header = (f"GOP {gops_used+1}/{args.num_gops}  {video_name}  "
+                header = (f"GOP {gops_used+1}/{target_gops}  {video_name}  "
                           f"frame {gt_idx}/{num_pframes} (P)")
                 tile = build_frame_tiles(
                     pframe_bgr, gt_target,

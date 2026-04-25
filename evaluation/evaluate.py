@@ -23,7 +23,7 @@ from models.refresh_policy import SaliencyRefreshPolicy
 from utils.metrics import COCOMetrics, LatencyTracker, DecodeBudgetTracker
 from utils.box_utils import xyxy_to_xywh, xywh_to_xyxy
 
-def evaluate_cope_delta_det(model, dataset, device, measure_latency=True, policy_w1=1.0, policy_w2=1.0, policy_thresh=0.5, num_classes=10, max_eval=None, ablation='full'):
+def evaluate_cope_delta_det(model, dataset, device, measure_latency=True, policy_w1=1.0, policy_w2=1.0, policy_thresh=0.5, num_classes=10, max_eval=None, ablation='full', freeze_classes=False):
     """Evaluate CoPE-Δ-Det on a dataset using the unified forward pass.
 
     Set policy_thresh >= 999 to disable the refresh policy entirely (pure CoPE,
@@ -32,6 +32,11 @@ def evaluate_cope_delta_det(model, dataset, device, measure_latency=True, policy
     ablation: 'full' = use all features (default)
               'mv_only' = zero out residual/depth/mode; only MVs reach delta encoder
               'appearance_only' = zero out MVs; only residual/depth/mode reach delta encoder
+
+    freeze_classes: if True, P-frames inherit the I-frame YOLO class labels instead of
+              using the fusion head's class logits. Use this for fair cross-checkpoint
+              comparisons — early checkpoints have an untrained class branch that tanks
+              mAP when cls_scores are used.
     """
     model.eval()
     metrics = COCOMetrics(num_classes=num_classes)
@@ -134,7 +139,12 @@ def evaluate_cope_delta_det(model, dataset, device, measure_latency=True, policy
                         updated_xywh = boxes_xywh + box_deltas
                         current_boxes = [xywh_to_xyxy(updated_xywh)]
                         current_confs = [flat_confs * conf_updates]
-                        current_classes = [cls_scores]
+                        # freeze_classes=True: keep I-frame YOLO class IDs for all P-frames
+                        # (fair comparison across checkpoints with different class-branch maturity)
+                        # freeze_classes=False: use fusion head's class logits (default, full model)
+                        if not freeze_classes:
+                            current_classes = [cls_scores]
+                        # else: current_classes stays as inherited from the previous frame
                         
                 predictions.append({'boxes': current_boxes, 'confs': current_confs, 'classes': current_classes})
                 
@@ -224,6 +234,10 @@ def main():
                         help='Ablation mode: full=all features (default), '
                              'mv_only=zero residual/depth/mode keep MVs, '
                              'appearance_only=zero MVs keep residual/depth/mode')
+    parser.add_argument('--freeze_classes', action='store_true',
+                        help='Inherit I-frame YOLO class IDs for all P-frames instead of '
+                             'using the fusion head class logits. Use for fair cross-checkpoint '
+                             'comparisons where early checkpoints have an untrained class branch.')
     args = parser.parse_args()
 
     # Dataset-specific defaults
@@ -308,11 +322,14 @@ def main():
     # Evaluate
     if args.ablation != 'full':
         print(f"  ablation: {args.ablation}")
+    if args.freeze_classes:
+        print(f"  freeze_classes: True (P-frames inherit I-frame YOLO class IDs)")
     results = evaluate_cope_delta_det(model, dataset, device, policy_w1=1.0, policy_w2=1.0,
                                       policy_thresh=args.policy_thresh,
                                       num_classes=args.num_classes,
                                       max_eval=args.max_eval,
-                                      ablation=args.ablation)
+                                      ablation=args.ablation,
+                                      freeze_classes=args.freeze_classes)
 
     # Print results
     print(f"\n{'='*60}")
@@ -342,6 +359,7 @@ def main():
                 'policy_thresh': args.policy_thresh,
                 'max_eval': args.max_eval,
                 'ablation': args.ablation,
+                'freeze_classes': args.freeze_classes,
                 'yolo_weights': args.yolo_weights,
                 'mAP_50': results['mAP_50'],
                 'mAP_50_95': results['mAP_50_95'],

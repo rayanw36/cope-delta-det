@@ -1,0 +1,14 @@
+{
+  "features": "features",
+  "dataset": "imagenetvid",
+  "split": "val",
+  "class_mapping": "identity",
+  "checkpoint": "checkpoints/vid_finetuned_model_epoch_15.pt",
+  "policy_thresh": 999.0,
+  "max_eval": 500,
+  "ablation": "full",
+  "yolo_weights": "runs/detect/yolov8m_vid/weights/best.pt",
+  "mAP_50": 0.05397013117098867,
+  "mAP_50_95": 0.030321005633197944,
+  "decode_budget": 6.25
+}

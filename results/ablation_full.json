@@ -3,12 +3,13 @@
   "dataset": "imagenetvid",
   "split": "val",
   "class_mapping": "identity",
-  "checkpoint": "D:\\cope-delta-det2\\checkpoints\\vid_finetuned_best.pt",
+  "checkpoint": "checkpoints/vid_finetuned_best.pt",
   "policy_thresh": 999.0,
   "max_eval": 500,
   "ablation": "full",
+  "freeze_classes": true,
   "yolo_weights": "runs/detect/yolov8m_vid/weights/best.pt",
-  "mAP_50": 0.26433774164889295,
-  "mAP_50_95": 0.14360675123735028,
+  "mAP_50": 0.28506795069383983,
+  "mAP_50_95": 0.15114305683004065,
   "decode_budget": 6.25
 }

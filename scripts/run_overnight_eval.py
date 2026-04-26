@@ -59,14 +59,28 @@ def wait_for_training(epoch: int = 30, poll_secs: int = 300):
 
 
 def load_json(path: Path) -> dict | None:
-    """Load a result JSON; unwrap single-element lists from evaluate_baselines.py."""
+    """Load a result JSON; unwrap single-element lists from evaluate_baselines.py.
+    Multi-element lists (e.g. loss history) are returned as-is.
+    """
     try:
         data = json.loads(path.read_text())
-        if isinstance(data, list):
-            return data[0] if len(data) == 1 else data[0]  # baselines always saves [{}]
+        if isinstance(data, list) and len(data) == 1:
+            return data[0]   # evaluate_baselines.py always saves [{...}]
         return data
     except Exception:
         return None
+
+
+def load_loss_history(path: Path) -> list:
+    """Load the training loss history JSON (always a list of {epoch, loss} dicts)."""
+    try:
+        data = json.loads(path.read_text())
+        if isinstance(data, list):
+            return data
+        # Should never happen, but guard against a bare dict
+        return [data]
+    except Exception:
+        return []
 
 
 def best_checkpoint(args_checkpoint: str) -> str:
@@ -105,7 +119,9 @@ def main():
                      '--class_mapping', 'identity',
                      '--yolo_weights', args.yolo,
                      '--num_classes', '30']
-    cope_flags = ['--checkpoint', ckpt, '--policy_thresh', '999']
+    # --freeze_classes: P-frames inherit I-frame YOLO class IDs instead of the
+    # fusion head's class logits, which are unreliable until Stage 3 is trained.
+    cope_flags = ['--checkpoint', ckpt, '--policy_thresh', '999', '--freeze_classes']
     # Baselines use max_eval too; None means all GOPs (no --max_eval flag passed = new default)
     max_full_baseline = ['--max_eval', str(args.max_full)] if args.max_full else []
     max_full_cope = ['--max_eval', str(args.max_full)] if args.max_full else []
@@ -196,7 +212,7 @@ def main():
     r_pyav  = load_json(out_cope_pyav)
 
     # loss history
-    loss_hist = load_json(HISTORY_JSON) or []
+    loss_hist = load_loss_history(HISTORY_JSON)
 
     now = datetime.now()
     summary_path = REPORT / f'overnight_summary_{now:%Y_%m_%d}.txt'
